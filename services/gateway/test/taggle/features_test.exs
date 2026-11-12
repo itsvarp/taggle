@@ -3,7 +3,15 @@ defmodule Taggle.FeaturesTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Taggle.Gateway.{DiscordAuth, DiscordStore, GitHubAuth, GitHubStore, Router, Socket}
+  alias Taggle.Gateway.{
+    AvatarCache,
+    DiscordAuth,
+    DiscordStore,
+    GitHubAuth,
+    GitHubStore,
+    Router,
+    Socket
+  }
 
   @opts Router.init([])
 
@@ -117,11 +125,19 @@ defmodule Taggle.FeaturesTest do
     assert missing.status == 404
   end
 
-  test "SVG card & badge are pure-vector, CSP-protected, and XML-escape XSS payloads", ctx do
+  test "SVG card & badge embed safe cached avatar, are CSP-protected, and XML-escape XSS payloads",
+       ctx do
     seed_linked_profile!(ctx, %{
       "global_name" => "<script>alert('xss')</script> & User",
       "coding" => %{"editor" => "VSCode", "file" => "<img onerror=alert(1)>"}
     })
+
+    # Tiny 1x1 transparent PNG data URI seeded in AvatarCache (outbound HTTP disabled in test env).
+    png_uri =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+
+    assert :ok == AvatarCache.put(AvatarCache.cache_key_for_github(ctx.login), png_uri)
+    assert {:error, :invalid_data_uri} == AvatarCache.put("bad", "https://evil.example/a.png")
 
     card =
       conn(
@@ -134,26 +150,30 @@ defmodule Taggle.FeaturesTest do
     assert get_resp_header(card, "content-type") == ["image/svg+xml; charset=utf-8"]
 
     assert get_resp_header(card, "content-security-policy") == [
-             "default-src 'none'; style-src 'unsafe-inline'"
+             "default-src 'none'; img-src data:; style-src 'unsafe-inline'"
            ]
 
     refute String.contains?(card.resp_body, "<script")
     refute String.contains?(card.resp_body, "javascript:")
     refute String.contains?(card.resp_body, "<img")
-    refute String.contains?(card.resp_body, "<image")
+    assert String.contains?(card.resp_body, "<image href=\"#{png_uri}\"")
+    refute String.contains?(card.resp_body, "<image href=\"http")
     assert String.contains?(card.resp_body, "&lt;script&gt;")
 
     profile_card =
-      conn(:get, "/v1/profiles/#{ctx.login}/card.svg?compact=true") |> Router.call(@opts)
+      conn(:get, "/v1/profiles/#{ctx.login}/card.svg?compact=true&avatar=false")
+      |> Router.call(@opts)
 
     assert profile_card.status == 200
-    assert String.contains?(profile_card.resp_body, ~s(height="118"))
+    assert String.contains?(profile_card.resp_body, ~s(height="96"))
+    refute String.contains?(profile_card.resp_body, "<image")
 
     badge =
       conn(:get, "/v1/users/#{ctx.discord_id}/badge.svg?accent=00ff88") |> Router.call(@opts)
 
     assert badge.status == 200
     assert String.contains?(badge.resp_body, "#00ff88")
+    assert String.contains?(badge.resp_body, "<image href=\"#{png_uri}\"")
   end
 
   test "self-hosted /taggle.js serves first-party Web Component SDK" do

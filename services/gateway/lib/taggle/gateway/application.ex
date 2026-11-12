@@ -6,6 +6,7 @@ defmodule Taggle.Gateway.Application do
   def start(_type, _args) do
     Taggle.Gateway.Metrics.init()
     Taggle.Gateway.RateLimit.init()
+    Taggle.Gateway.AvatarCache.init()
 
     redis_url = System.get_env("REDIS_URL", "redis://localhost:6380")
 

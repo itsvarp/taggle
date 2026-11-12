@@ -243,7 +243,7 @@ defmodule Taggle.Gateway.Router do
         |> Plug.Conn.put_resp_content_type("image/svg+xml", "utf-8")
         |> Plug.Conn.put_resp_header(
           "content-security-policy",
-          "default-src 'none'; style-src 'unsafe-inline'"
+          "default-src 'none'; img-src data:; style-src 'unsafe-inline'"
         )
         |> Plug.Conn.put_resp_header("cache-control", "public, max-age=10, s-maxage=10")
         |> Plug.Conn.send_resp(200, svg)
