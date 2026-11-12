@@ -51,6 +51,7 @@ struct BotContext {
     registered_guilds: Mutex<HashSet<String>>,
     guild_members: Mutex<HashMap<String, HashSet<String>>>,
     guild_online: Mutex<HashMap<String, HashSet<String>>>,
+    member_users: Mutex<HashMap<String, Value>>,
     pending_connects: Mutex<HashMap<String, (u64, AbortHandle)>>,
     connect_cooldowns: Mutex<HashMap<String, Instant>>,
     presence_txs: Vec<tokio::sync::mpsc::Sender<PresenceJob>>,
@@ -102,11 +103,35 @@ impl BotContext {
             registered_guilds: Mutex::new(HashSet::new()),
             guild_members: Mutex::new(HashMap::new()),
             guild_online: Mutex::new(HashMap::new()),
+            member_users: Mutex::new(HashMap::new()),
             pending_connects: Mutex::new(HashMap::new()),
             connect_cooldowns: Mutex::new(HashMap::new()),
             presence_txs,
             next_task_id: AtomicU64::new(1),
         })
+    }
+
+    fn cache_user(&self, user: &Value) {
+        let Some(id) = user.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if !valid_snowflake(id) || user.get("username").and_then(Value::as_str).is_none() {
+            return;
+        }
+        let mut map = self.member_users.lock().unwrap();
+        if map.len() > 20_000 && !map.contains_key(id) {
+            return;
+        }
+        map.insert(id.to_owned(), user.clone());
+    }
+
+    fn cached_member(&self, user_id: &str) -> Option<Value> {
+        self.member_users
+            .lock()
+            .unwrap()
+            .get(user_id)
+            .cloned()
+            .map(|user| json!({ "user": user }))
     }
 
     fn shard_for(user_id: &str) -> usize {
@@ -516,6 +541,9 @@ async fn handle_dispatch(
                 .into_iter()
                 .flatten()
                 .filter_map(|m| {
+                    if let Some(u) = m.get("user") {
+                        ctx.cache_user(u);
+                    }
                     m.pointer("/user/id")
                         .and_then(Value::as_str)
                         .map(|id| (id, m))
@@ -531,17 +559,30 @@ async fn handle_dispatch(
                 .into_iter()
                 .flatten()
             {
+                if let Some(u) = presence.get("user") {
+                    ctx.cache_user(u);
+                }
                 if let Some(id) = presence.pointer("/user/id").and_then(Value::as_str) {
                     member_ids.insert(id.to_owned());
                     if presence.get("status").and_then(Value::as_str) != Some("offline") {
                         online_ids.insert(id.to_owned());
                     }
                 }
-                let member = presence
+                let member_from_guild = presence
                     .pointer("/user/id")
                     .and_then(Value::as_str)
                     .and_then(|id| members.get(id).copied());
-                if let Some((uid, normalized)) = normalize_presence(presence, member) {
+                let cached_fallback = if member_from_guild.is_none() {
+                    presence
+                        .pointer("/user/id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| ctx.cached_member(id))
+                } else {
+                    None
+                };
+                if let Some((uid, normalized)) =
+                    normalize_presence(presence, member_from_guild.or(cached_fallback.as_ref()))
+                {
                     ctx.enqueue_presence(app, uid, normalized);
                 }
             }
@@ -572,26 +613,32 @@ async fn handle_dispatch(
             if !guild_allowed(app, guild_id) {
                 return Ok(());
             }
+            if let Some(u) = data.get("user") {
+                ctx.cache_user(u);
+            }
             let status = data
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("offline");
-            if let (Some(gid), Some(user_id)) =
-                (guild_id, data.pointer("/user/id").and_then(Value::as_str))
-            {
+            let uid = data.pointer("/user/id").and_then(Value::as_str);
+            if let (Some(gid), Some(user_id)) = (guild_id, uid) {
                 ctx.add_guild_member(gid, user_id);
                 ctx.update_guild_online(gid, user_id, status);
             }
-            if let Some((uid, normalized)) = normalize_presence(data, None) {
+            let cached = uid.and_then(|id| ctx.cached_member(id));
+            if let Some((uid, normalized)) = normalize_presence(data, cached.as_ref()) {
                 ctx.enqueue_presence(app, uid, normalized);
             }
         }
-        "GUILD_MEMBER_ADD" => {
+        "GUILD_MEMBER_ADD" | "GUILD_MEMBER_UPDATE" => {
             let Some(guild_id) = data.get("guild_id").and_then(Value::as_str) else {
                 return Ok(());
             };
             if !guild_allowed(app, Some(guild_id)) {
                 return Ok(());
+            }
+            if let Some(u) = data.get("user") {
+                ctx.cache_user(u);
             }
             if let Some(user_id) = data.pointer("/user/id").and_then(Value::as_str) {
                 ctx.add_guild_member(guild_id, user_id);
@@ -1849,8 +1896,10 @@ pub fn normalize_presence(data: &Value, member: Option<&Value>) -> Option<(Strin
         return None;
     }
 
+    let has_full_user = user.get("username").and_then(Value::as_str).is_some();
     let field = |key: &str| {
         user.get(key)
+            .filter(|v| has_full_user || !v.is_null())
             .or_else(|| member_user.and_then(|m| m.get(key)))
             .cloned()
             .unwrap_or(Value::Null)
@@ -2157,6 +2206,32 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("@octocat")
+        );
+    }
+
+    #[test]
+    fn partial_presence_update_preserves_cached_avatar_and_profile() {
+        let cached_member = json!({
+            "user": {
+                "id": "490201225921298463",
+                "username": "varpsec",
+                "global_name": "Varp",
+                "avatar": "cb89941afc2aad170afadb740325c9a9"
+            }
+        });
+        let partial_presence = json!({
+            "user": { "id": "490201225921298463", "avatar": null },
+            "status": "dnd",
+            "activities": []
+        });
+
+        let (_, normalized) = normalize_presence(&partial_presence, Some(&cached_member)).unwrap();
+        assert_eq!(normalized["discord_status"], "dnd");
+        assert_eq!(normalized["discord_user"]["username"], "varpsec");
+        assert_eq!(normalized["discord_user"]["global_name"], "Varp");
+        assert_eq!(
+            normalized["discord_user"]["avatar"],
+            "cb89941afc2aad170afadb740325c9a9"
         );
     }
 }

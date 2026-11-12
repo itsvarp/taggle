@@ -933,7 +933,10 @@ impl Store {
         if let Some(obj) = presence_no_kv.as_object_mut() {
             obj.remove("kv");
         }
-        let presence_json = presence_no_kv.to_string();
+        let missing_profile = presence_no_kv
+            .pointer("/discord_user/username")
+            .is_none_or(Value::is_null);
+        let mut presence_json = presence_no_kv.to_string();
 
         let mut r = self.redis.clone();
         let presence_key = format!("taggle:discord:presence:{user_id}");
@@ -945,7 +948,8 @@ impl Store {
             .await
             .unwrap_or((None, false));
 
-        if has_state && prev_presence.as_deref() == Some(presence_json.as_str()) {
+        if !missing_profile && has_state && prev_presence.as_deref() == Some(presence_json.as_str())
+        {
             return Ok(());
         }
 
@@ -954,6 +958,66 @@ impl Store {
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
+
+        if missing_profile {
+            // Preserve previously known Discord profile fields when a partial
+            // PRESENCE_UPDATE (containing only user.id) arrives on a cold cache.
+            if let Some(row) = sqlx::query(
+                "SELECT
+                    COALESCE(NULLIF(p.data->'discord_user'->>'username', ''), u.username) AS username,
+                    COALESCE(NULLIF(p.data->'discord_user'->>'global_name', ''), u.global_name) AS global_name,
+                    COALESCE(NULLIF(p.data->'discord_user'->>'avatar', ''), u.avatar) AS avatar,
+                    NULLIF(p.data->'discord_user'->>'discriminator', '') AS discriminator,
+                    p.data->'discord_user'->'public_flags' AS public_flags
+                 FROM (SELECT 1) AS _seed
+                 LEFT JOIN discord_presences p ON p.user_id = $1
+                 LEFT JOIN discord_users u ON u.id = $1",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+                && let Some(du) = presence_no_kv
+                    .get_mut("discord_user")
+                    .and_then(Value::as_object_mut)
+            {
+                let username: Option<String> = row.get("username");
+                let global_name: Option<String> = row.get("global_name");
+                let avatar: Option<String> = row.get("avatar");
+                let discriminator: Option<String> = row.get("discriminator");
+                let public_flags: Option<Value> = row.get("public_flags");
+                if du.get("username").is_none_or(Value::is_null)
+                    && let Some(v) = username
+                {
+                    du.insert("username".into(), Value::String(v));
+                }
+                if du.get("global_name").is_none_or(Value::is_null)
+                    && let Some(v) = global_name
+                {
+                    du.insert("global_name".into(), Value::String(v));
+                }
+                if du.get("avatar").is_none_or(Value::is_null)
+                    && let Some(v) = avatar
+                {
+                    du.insert("avatar".into(), Value::String(v));
+                }
+                if du.get("discriminator").is_none_or(Value::is_null)
+                    && let Some(v) = discriminator
+                {
+                    du.insert("discriminator".into(), Value::String(v));
+                }
+                if let Some(v) = public_flags
+                    && !v.is_null()
+                {
+                    du.insert("public_flags".into(), v);
+                }
+                presence_json = presence_no_kv.to_string();
+            }
+        }
+
+        if has_state && prev_presence.as_deref() == Some(presence_json.as_str()) {
+            tx.commit().await?;
+            return Ok(());
+        }
 
         let kv = self.discord_kv_on(&mut *tx, user_id).await?;
         let fallback_kv_json = Value::Object(kv.clone()).to_string();
