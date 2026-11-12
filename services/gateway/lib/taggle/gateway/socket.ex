@@ -17,6 +17,7 @@ defmodule Taggle.Gateway.Socket do
 
   @heartbeat_ms 30_000
   @max_subs 20
+  @init_cooldown_ms 500
   @all_key "dc:all"
 
   @impl true
@@ -24,7 +25,7 @@ defmodule Taggle.Gateway.Socket do
     timer = Process.send_after(self(), :heartbeat_timeout, @heartbeat_ms * 2)
 
     {:push, {:text, encode(%{op: 1, d: %{heartbeat_interval: @heartbeat_ms}})},
-     %{timer: timer, subs: MapSet.new(), filter: nil}}
+     %{timer: timer, subs: MapSet.new(), filter: nil, last_init_at: nil}}
   end
 
   @impl true
@@ -56,19 +57,25 @@ defmodule Taggle.Gateway.Socket do
   def handle_in(_, state), do: {:ok, state}
 
   @impl true
-  def handle_info({:activity_update, login, payload}, %{subs: subs} = state) do
+  def handle_info({:activity_update, login, payload}, %{subs: subs} = state) when is_binary(payload) do
     if MapSet.member?(subs, "gh:" <> login) do
-      data =
-        if state.filter, do: payload |> JSON.decode!() |> Filter.apply(state.filter), else: JSON.decode!(payload)
+      frame =
+        if state.filter do
+          data = payload |> JSON.decode!() |> Filter.apply(state.filter)
+          encode(%{op: 0, t: "ACTIVITY_UPDATE", d: data})
+        else
+          # `payload` is already serialized JSON from ingest/store; wrap without decode+encode.
+          "{\"op\":0,\"t\":\"ACTIVITY_UPDATE\",\"d\":" <> payload <> "}"
+        end
 
-      {:push, {:text, encode(%{op: 0, t: "ACTIVITY_UPDATE", d: data})}, state}
+      {:push, {:text, frame}, state}
     else
       {:ok, state}
     end
   end
 
-  def handle_info({:discord_presence_update, payload}, state) do
-    {:push, {:text, encode(%{op: 0, t: "PRESENCE_UPDATE", d: JSON.decode!(payload)})}, state}
+  def handle_info({:discord_presence_update, payload}, state) when is_binary(payload) do
+    {:push, {:text, "{\"op\":0,\"t\":\"PRESENCE_UPDATE\",\"d\":" <> payload <> "}"}, state}
   end
 
   def handle_info(:heartbeat_timeout, state), do: {:stop, :normal, {4004, "heartbeat timeout"}, state}
@@ -78,6 +85,16 @@ defmodule Taggle.Gateway.Socket do
   def terminate(_reason, _state), do: :ok
 
   defp subscribe(d, state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    if is_integer(state.last_init_at) and now_ms - state.last_init_at < @init_cooldown_ms do
+      push_error(state, "rate_limited")
+    else
+      do_subscribe(d, %{state | last_init_at: now_ms})
+    end
+  end
+
+  defp do_subscribe(d, state) do
     all? = d["subscribe_to_all"] === true
 
     ids =
@@ -107,7 +124,7 @@ defmodule Taggle.Gateway.Socket do
         keys = if all?, do: MapSet.put(keys, @all_key), else: keys
         for key <- keys, do: Registry.register(Taggle.Gateway.Subs, key, nil)
 
-        filter = if is_map(d["filter"]), do: d["filter"], else: nil
+        filter = if is_map(d["filter"]), do: Map.take(d["filter"], ["types", "repos", "limit"]), else: nil
 
         init_state =
           if all? do

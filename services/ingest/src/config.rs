@@ -17,6 +17,7 @@ pub struct Config {
     pub database_url: String,
     pub redis_url: String,
     pub port: u16,
+    pub github_client_id: Option<String>,
     pub github: Option<GitHubConfig>,
     pub discord: Option<DiscordConfig>,
 }
@@ -27,6 +28,7 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
 
+        let github_client_id = non_empty("GITHUB_APP_CLIENT_ID");
         let github = match non_empty("GITHUB_APP_ID") {
             Some(app_id) => Some(GitHubConfig {
                 webhook_secret: non_empty("GITHUB_WEBHOOK_SECRET")
@@ -51,6 +53,7 @@ impl Config {
                 .unwrap_or_else(|_| "postgres://taggle:taggle@localhost:5433/taggle".into()),
             redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6380".into()),
             port: std::env::var("INGEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4001),
+            github_client_id,
             github,
             discord,
         })

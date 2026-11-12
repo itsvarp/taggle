@@ -20,9 +20,11 @@ defmodule Taggle.Gateway.GitHubFanout do
 
   @impl true
   def handle_info({:redix_pubsub, _pid, _ref, :pmessage, %{channel: @prefix <> login, payload: payload}}, state) do
-    Registry.dispatch(Taggle.Gateway.Subs, "gh:" <> login, fn entries ->
-      for {pid, _} <- entries, do: send(pid, {:activity_update, login, payload})
-    end)
+    if Taggle.Gateway.GitHubStore.connected?(login) do
+      Registry.dispatch(Taggle.Gateway.Subs, "gh:" <> login, fn entries ->
+        for {pid, _} <- entries, do: send(pid, {:activity_update, login, payload})
+      end)
+    end
 
     {:noreply, state}
   end

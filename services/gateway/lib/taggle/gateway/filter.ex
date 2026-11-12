@@ -8,19 +8,19 @@ defmodule Taggle.Gateway.Filter do
   def apply(data, params) when map_size(params) == 0, do: data
 
   def apply(data, params) when is_map(data) and is_map(params) do
-    types = to_list(params["types"])
-    repos = to_list(params["repos"])
+    types = to_set(params["types"])
+    repos = to_set(params["repos"])
     limit = parse_limit(params["limit"])
 
     Enum.reduce(@list_keys, data, fn key, acc ->
       cond do
-        types != [] and key not in types ->
+        MapSet.size(types) > 0 and not MapSet.member?(types, key) ->
           Map.put(acc, key, [])
 
         is_list(acc[key]) ->
           list =
             acc[key]
-            |> Enum.filter(&(repos == [] or &1["repo"] in repos))
+            |> Enum.filter(&(MapSet.size(repos) == 0 or MapSet.member?(repos, &1["repo"])))
             |> then(&if(limit, do: Enum.take(&1, limit), else: &1))
 
           Map.put(acc, key, list)
@@ -31,10 +31,27 @@ defmodule Taggle.Gateway.Filter do
     end)
   end
 
-  defp to_list(nil), do: []
-  defp to_list(list) when is_list(list), do: list |> Enum.filter(&is_binary/1) |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
-  defp to_list(s) when is_binary(s), do: s |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
-  defp to_list(_), do: []
+  defp to_set(nil), do: MapSet.new()
+
+  defp to_set(list) when is_list(list) do
+    list
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.take(25)
+    |> MapSet.new()
+  end
+
+  defp to_set(s) when is_binary(s) do
+    s
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.take(25)
+    |> MapSet.new()
+  end
+
+  defp to_set(_), do: MapSet.new()
 
   defp parse_limit(n) when is_integer(n) and n > 0, do: min(n, 100)
 

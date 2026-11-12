@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use futures_util::{StreamExt, stream};
 
 use crate::App;
 
@@ -36,12 +37,19 @@ pub async fn sync_all(app: &App) -> Result<()> {
         }
     }
 
+    if let Err(err) = app.store.purge_unlinked_github_users().await {
+        tracing::warn!(error = %err, "purge_unlinked_github_users failed");
+    }
+
     let mut dirty = BTreeSet::new();
 
     match github.list_app_installations().await {
         Ok(installs) => {
             for inst in installs {
                 let login_lower = inst.login.to_lowercase();
+                if !app.store.is_github_connected(&login_lower).await.unwrap_or(false) {
+                    continue;
+                }
                 if let Err(err) = app
                     .store
                     .upsert_user(inst.account_id, &login_lower, inst.avatar_url.as_deref())
@@ -55,7 +63,7 @@ pub async fn sync_all(app: &App) -> Result<()> {
                     continue;
                 }
                 match github.backfill_installation(inst.id).await {
-                    Ok(acts) => {
+                    Ok(acts) if !acts.is_empty() => {
                         for act in acts {
                             if let Err(err) = app
                                 .store
@@ -67,6 +75,7 @@ pub async fn sync_all(app: &App) -> Result<()> {
                         }
                         dirty.insert(login_lower);
                     }
+                    Ok(_) => {}
                     Err(err) => tracing::warn!(error = %err, installation = inst.id, "installation sync failed"),
                 }
             }
@@ -74,10 +83,24 @@ pub async fn sync_all(app: &App) -> Result<()> {
         Err(err) => tracing::warn!(error = %err, "list_app_installations failed"),
     }
 
-    for login in app.store.list_user_logins().await? {
+    let connected: Vec<String> = app
+        .store
+        .list_connected_github_logins()
+        .await?
+        .into_iter()
+        .filter(|l| crate::store::valid_github_login(l))
+        .collect();
+
+    let mut fetches = stream::iter(connected.into_iter().map(|login| async move {
         let use_etag = app.store.has_activities(&login).await.unwrap_or(false);
-        match github.backfill_user_public(&login, None, use_etag).await {
-            Ok(acts) => {
+        let res = github.backfill_user_public(&login, None, use_etag).await;
+        (login, res)
+    }))
+    .buffer_unordered(4);
+
+    while let Some((login, res)) = fetches.next().await {
+        match res {
+            Ok(acts) if !acts.is_empty() => {
                 for act in acts {
                     if let Err(err) = app
                         .store
@@ -89,6 +112,7 @@ pub async fn sync_all(app: &App) -> Result<()> {
                 }
                 dirty.insert(login);
             }
+            Ok(_) => {}
             Err(err) => tracing::warn!(error = %err, %login, "public sync failed"),
         }
     }
@@ -99,6 +123,10 @@ pub async fn sync_all(app: &App) -> Result<()> {
         }
     }
 
+    if let Err(err) = app.store.prune_old_activities(60).await {
+        tracing::warn!(error = %err, "prune_old_activities failed");
+    }
+
     Ok(())
 }
 
@@ -106,7 +134,7 @@ pub async fn sync_user(app: &App, login: &str, oauth_token: Option<&str>) -> Res
     let Some(github) = app.github.as_ref() else { return Ok(()) };
 
     let login_lower = login.trim().to_lowercase();
-    if login_lower.is_empty() {
+    if login_lower.is_empty() || !app.store.is_github_connected(&login_lower).await? {
         return Ok(());
     }
 

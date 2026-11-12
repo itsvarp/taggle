@@ -4,6 +4,8 @@ defmodule Taggle.Gateway.GitHubStore do
   """
   require Logger
 
+  @max_kv_pairs 512
+
   @doc "Fetches the serialized JSON snapshot from Redis, falling back to Postgres on miss."
   def get_snapshot_raw(login) when is_binary(login) do
     key = "taggle:state:" <> login
@@ -21,12 +23,38 @@ defmodule Taggle.Gateway.GitHubStore do
     end
   end
 
+  def connected?(login) when is_binary(login) do
+    case Postgrex.query(:pg, "SELECT EXISTS(SELECT 1 FROM discord_github_links WHERE github_login = $1)", [login]) do
+      {:ok, %Postgrex.Result{rows: [[true]]}} -> true
+      _ -> false
+    end
+  end
+
+  def connected?(_), do: false
+
   def get_snapshot(login) do
-    if Taggle.Gateway.Ids.github_login?(login) do
+    if Taggle.Gateway.Ids.github_login?(login) and connected?(login) do
       case get_snapshot_raw(login) do
-        {:ok, nil} -> {:ok, nil}
-        {:ok, raw} -> {:ok, JSON.decode!(raw)}
-        err -> err
+        {:ok, nil} ->
+          {:ok, nil}
+
+        {:ok, raw} ->
+          case JSON.decode(raw) do
+            {:ok, decoded} ->
+              {:ok, decoded}
+
+            {:error, _} ->
+              with {:ok, fresh} when is_binary(fresh) <- read_through_pg(login, "taggle:state:" <> login),
+                   {:ok, decoded} <- JSON.decode(fresh) do
+                {:ok, decoded}
+              else
+                {:ok, nil} -> {:ok, nil}
+                _ -> {:error, :invalid_json}
+              end
+          end
+
+        err ->
+          err
       end
     else
       {:ok, nil}
@@ -50,6 +78,7 @@ defmodule Taggle.Gateway.GitHubStore do
 
   def upsert_user_from_oauth(%{id: id, login: login, name: name, avatar_url: avatar_url}) do
     login = String.downcase(login)
+    if not Taggle.Gateway.Ids.github_login?(login), do: raise(ArgumentError, "invalid github login")
 
     Postgrex.query!(
       :pg,
@@ -66,20 +95,6 @@ defmodule Taggle.Gateway.GitHubStore do
 
     ensure_snapshot!(id, login, name, avatar_url)
     login
-  end
-
-  def record_installation(installation_id, login) when is_integer(installation_id) do
-    login = String.downcase(login)
-
-    Postgrex.query!(
-      :pg,
-      """
-      INSERT INTO installations (id, account_login)
-      VALUES ($1, $2)
-      ON CONFLICT (id) DO UPDATE SET account_login = EXCLUDED.account_login
-      """,
-      [installation_id, login]
-    )
   end
 
   def ensure_snapshot!(id, login, name, avatar_url) do
@@ -113,62 +128,13 @@ defmodule Taggle.Gateway.GitHubStore do
     end
   end
 
-  def user_overview(login) do
-    user_row =
-      Postgrex.query!(
-        :pg,
-        "SELECT id, name, avatar_url, api_key_hash IS NOT NULL FROM users WHERE login = $1",
-        [login]
-      )
-
-    case user_row.rows do
-      [[id, name, avatar_url, has_key]] ->
-        %Postgrex.Result{rows: [[inst_count]]} =
-          Postgrex.query!(
-            :pg,
-            "SELECT count(*) FROM installations WHERE account_login = $1",
-            [login]
-          )
-
-        %Postgrex.Result{rows: kv_rows} =
-          Postgrex.query!(
-            :pg,
-            "SELECT key, value FROM user_kv WHERE login = $1 ORDER BY key",
-            [login]
-          )
-
-        snap =
-          case get_snapshot(login) do
-            {:ok, s} when is_map(s) -> s
-            _ -> %{}
-          end
-
-        {:ok,
-         %{
-           id: id,
-           login: login,
-           name: name,
-           avatar_url: avatar_url,
-           has_api_key: has_key,
-           installations: inst_count,
-           kv: Map.new(kv_rows, fn [k, v] -> {k, v} end),
-           commits: Map.get(snap, "commits", []),
-           pull_requests: Map.get(snap, "pull_requests", []),
-           issues: Map.get(snap, "issues", [])
-         }}
-
-      [] ->
-        :not_found
-    end
-  end
-
   def rotate_api_key(login) do
     if Taggle.Gateway.Ids.github_login?(login) do
       token = "tggl_" <> (:crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false))
       hash = sha256_hex(token)
 
-      case Postgrex.query!(:pg, "UPDATE users SET api_key_hash = $1 WHERE login = $2", [hash, login]) do
-        %Postgrex.Result{num_rows: 1} -> {:ok, token}
+      case Postgrex.query(:pg, "UPDATE users SET api_key_hash = $1 WHERE login = $2", [hash, login]) do
+        {:ok, %Postgrex.Result{num_rows: 1}} -> {:ok, token}
         _ -> :not_found
       end
     else
@@ -177,7 +143,7 @@ defmodule Taggle.Gateway.GitHubStore do
   end
 
   def valid_api_key?(login, token) when is_binary(token) and byte_size(token) > 0 do
-    if Taggle.Gateway.Ids.github_login?(login) do
+    if Taggle.Gateway.Ids.github_login?(login) and connected?(login) do
       verify_api_key(login, token)
     else
       false
@@ -200,6 +166,8 @@ defmodule Taggle.Gateway.GitHubStore do
     with true <- Taggle.Gateway.Ids.github_login?(login),
          :ok <- validate_kv_pairs(pairs) do
       Postgrex.transaction(:pg, fn conn ->
+        Postgrex.query!(conn, "SELECT pg_advisory_xact_lock(hashtext('ghkv:' || $1))", [login])
+
         for {k, v} <- pairs do
           Postgrex.query!(
             conn,
@@ -211,8 +179,16 @@ defmodule Taggle.Gateway.GitHubStore do
           )
         end
 
-        sync_kv_snapshot!(conn, login)
+        %Postgrex.Result{rows: [[total]]} =
+          Postgrex.query!(conn, "SELECT count(*) FROM user_kv WHERE login = $1", [login])
+
+        if total > @max_kv_pairs do
+          Postgrex.rollback(conn, "too_many_keys")
+        end
+
+        collect_kv_snapshot!(conn, login)
       end)
+      |> finalize_kv_publish(login)
     else
       false -> {:error, "invalid_login"}
       {:error, _} = err -> err
@@ -223,15 +199,19 @@ defmodule Taggle.Gateway.GitHubStore do
     with true <- Taggle.Gateway.Ids.github_login?(login),
          true <- Regex.match?(~r/^[a-zA-Z0-9._-]{1,64}$/, key) do
       Postgrex.transaction(:pg, fn conn ->
+        Postgrex.query!(conn, "SELECT pg_advisory_xact_lock(hashtext('ghkv:' || $1))", [login])
         Postgrex.query!(conn, "DELETE FROM user_kv WHERE login = $1 AND key = $2", [login, key])
-        sync_kv_snapshot!(conn, login)
+        collect_kv_snapshot!(conn, login)
       end)
+      |> finalize_kv_publish(login)
     else
       false -> {:error, "invalid_key"}
     end
   end
 
-  defp sync_kv_snapshot!(conn, login) do
+  def delete_kv(_, _), do: {:error, "invalid_key"}
+
+  defp collect_kv_snapshot!(conn, login) do
     %Postgrex.Result{rows: kv_rows} =
       Postgrex.query!(conn, "SELECT key, value FROM user_kv WHERE login = $1", [login])
 
@@ -248,15 +228,21 @@ defmodule Taggle.Gateway.GitHubStore do
            [login, kv]
          ) do
       %Postgrex.Result{rows: [[snapshot]]} ->
-        raw = JSON.encode!(snapshot)
-        _ = Redix.command(:redix, ["SET", "taggle:state:" <> login, raw])
-        _ = Redix.command(:redix, ["PUBLISH", "taggle:events:" <> login, raw])
-        kv
+        {:publish, kv, JSON.encode!(snapshot)}
 
       %Postgrex.Result{rows: []} ->
-        kv
+        {:noop, kv}
     end
   end
+
+  defp finalize_kv_publish({:ok, {:publish, kv, raw}}, login) do
+    _ = Redix.command(:redix, ["SET", "taggle:state:" <> login, raw])
+    _ = Redix.command(:redix, ["PUBLISH", "taggle:events:" <> login, raw])
+    {:ok, kv}
+  end
+
+  defp finalize_kv_publish({:ok, {:noop, kv}}, _login), do: {:ok, kv}
+  defp finalize_kv_publish({:error, reason}, _login), do: {:error, reason}
 
   defp validate_kv_pairs(pairs) when map_size(pairs) > 50, do: {:error, "too_many_keys"}
 

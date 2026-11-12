@@ -22,7 +22,14 @@ defmodule Taggle.Gateway.Ids do
   def source(_), do: :invalid
 
   def discord_id?(value) when is_binary(value) do
-    value != "0" and Regex.match?(@discord, value) and match?({_, ""}, Integer.parse(value))
+    if not String.starts_with?(value, "0") and Regex.match?(@discord, value) do
+      case Integer.parse(value) do
+        {n, ""} -> n > 0 and n <= 18_446_744_073_709_551_615
+        _ -> false
+      end
+    else
+      false
+    end
   end
 
   def discord_id?(_), do: false

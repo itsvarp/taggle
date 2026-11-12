@@ -2,55 +2,35 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Router,
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use hmac::{Hmac, KeyInit, Mac};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use tokio::sync::Semaphore;
 
-use crate::{App, normalize, sync};
+use crate::{App, normalize};
 
-#[derive(Deserialize)]
-struct SyncReq {
-    login: String,
-    oauth_token: Option<String>,
+#[derive(Clone)]
+struct WebhookState {
+    app: Arc<App>,
+    jobs: Arc<Semaphore>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
+    let state = WebhookState {
+        app,
+        jobs: Arc::new(Semaphore::new(32)),
+    };
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/webhooks/github", post(github_webhook))
-        .route("/internal/sync", post(manual_sync))
-        .with_state(app)
-}
-
-async fn manual_sync(State(app): State<Arc<App>>, Json(req): Json<SyncReq>) -> StatusCode {
-    if app.config.github.is_none() {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-    let login = req.login.trim().to_lowercase();
-    if login.is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
-    if req.oauth_token.is_none() {
-        match app.store.allow_manual_sync(&login, 10).await {
-            Ok(true) => {}
-            Ok(false) => return StatusCode::OK,
-            Err(_) => {}
-        }
-    }
-    match sync::sync_user(&app, &login, req.oauth_token.as_deref()).await {
-        Ok(()) => StatusCode::OK,
-        Err(err) => {
-            tracing::warn!(error = %err, %login, "manual sync failed");
-            StatusCode::BAD_GATEWAY
-        }
-    }
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .with_state(state)
 }
 
 /// Constant-time check of `X-Hub-Signature-256: sha256=<hex>`.
@@ -62,7 +42,8 @@ pub fn verify_signature(secret: &str, body: &[u8], header: &str) -> bool {
     mac.verify_slice(&sig).is_ok()
 }
 
-async fn github_webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> StatusCode {
+async fn github_webhook(State(state): State<WebhookState>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let app = &state.app;
     let Some(github) = app.config.github.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE; // Discord-only deployment
     };
@@ -73,7 +54,7 @@ async fn github_webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: B
         return StatusCode::UNAUTHORIZED;
     }
     let (event, delivery) = (header("x-github-event").to_owned(), header("x-github-delivery").to_owned());
-    if event.is_empty() || delivery.is_empty() {
+    if event.is_empty() || delivery.is_empty() || delivery.len() > 128 {
         return StatusCode::BAD_REQUEST;
     }
     let Ok(payload) = serde_json::from_slice::<Value>(&body) else { return StatusCode::BAD_REQUEST };
@@ -87,9 +68,12 @@ async fn github_webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: B
         }
     }
 
-    // Ack fast; GitHub gives webhooks 10s.
+    // Ack fast; GitHub gives webhooks 10s, while bounding background concurrency.
+    let app_bg = Arc::clone(&state.app);
+    let jobs = Arc::clone(&state.jobs);
     tokio::spawn(async move {
-        if let Err(e) = process(&app, &event, &payload).await {
+        let Ok(_permit) = jobs.acquire_owned().await else { return };
+        if let Err(e) = process(&app_bg, &event, &payload).await {
             tracing::error!(error = %e, %event, %delivery, "processing failed");
         }
     });
@@ -112,15 +96,23 @@ async fn process(app: &App, event: &str, p: &Value) -> Result<()> {
             };
             match normalize::s(p, "/action") {
                 Some("created") | Some("unsuspend") | Some("new_permissions_accepted") => {
+                    let login_lower = login.to_lowercase();
+                    if !store.is_github_connected(&login_lower).await? {
+                        tracing::debug!(login = %login_lower, "ignoring installation for unlinked github user");
+                        return Ok(());
+                    }
                     store.upsert_user(account_id, login, normalize::s(p, "/installation/account/avatar_url")).await?;
                     store.upsert_installation(id, login).await?;
-                    let login_lower = login.to_lowercase();
                     run_backfill(app, id, &login_lower).await?;
                     store.rebuild_snapshot(&login_lower).await?;
                     tracing::info!(login, "installation added");
                 }
                 Some("deleted") | Some("suspend") => {
-                    store.remove_installation(id).await?;
+                    if let Some(removed_login) = store.remove_installation(id).await?
+                        && store.is_github_connected(&removed_login).await?
+                    {
+                        let _ = crate::sync::sync_user(app, &removed_login, None).await;
+                    }
                     tracing::info!(login, "installation removed");
                 }
                 _ => {}
@@ -130,7 +122,9 @@ async fn process(app: &App, event: &str, p: &Value) -> Result<()> {
         "installation_repositories" => {
             let Some(id) = installation else { return Ok(()) };
             if normalize::s(p, "/action") == Some("added") {
-                if let Some(login) = store.login_for_installation(id).await? {
+                if let Some(login) = store.login_for_installation(id).await?
+                    && store.is_github_connected(&login).await?
+                {
                     run_backfill(app, id, &login).await?;
                     store.rebuild_snapshot(&login).await?;
                 }
@@ -145,6 +139,9 @@ async fn process(app: &App, event: &str, p: &Value) -> Result<()> {
         tracing::debug!(installation, event, "event for unknown installation");
         return Ok(());
     };
+    if !store.is_github_connected(&login).await? {
+        return Ok(());
+    }
 
     if event == "deployment_status" {
         if let (Some(repo), Some(branch), Some(raw_state)) = (
@@ -158,8 +155,9 @@ async fn process(app: &App, event: &str, p: &Value) -> Result<()> {
                 "failure" | "error" => "error",
                 other => other,
             };
-            store.patch_pr_deployment(&login, repo, branch, mapped).await?;
-            store.rebuild_snapshot(&login).await?;
+            if store.patch_pr_deployment(&login, repo, branch, mapped).await? {
+                store.rebuild_snapshot(&login).await?;
+            }
         }
         return Ok(());
     }

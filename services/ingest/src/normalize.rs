@@ -88,7 +88,7 @@ fn push(p: &Value) -> Vec<Act> {
                     "repo": public_only(private, json!(repo)),
                     "branch": public_only(private, json!(branch)),
                     "private": private,
-                    "author": author.map(person),
+                    "author": public_only(private, json!(author.map(person))),
                     "url": public_only(private, json!(s(c, "/url"))),
                     "timestamp": ts(c, "/timestamp"),
                 }),
@@ -124,7 +124,7 @@ fn pull_request(p: &Value, pr: &Value) -> Option<Act> {
             "state": state,
             "draft": pr.get("draft").and_then(Value::as_bool).unwrap_or(false),
             "private": private,
-            "author": s(pr, "/user/login").map(person),
+            "author": public_only(private, json!(s(pr, "/user/login").map(person))),
             "url": public_only(private, json!(s(pr, "/html_url"))),
             "updated_at": at,
         }),
@@ -158,7 +158,7 @@ fn issue(p: &Value, i: &Value) -> Option<Act> {
             "labels": if private { json!([]) } else { Value::Array(labels) },
             "comments": i.get("comments").and_then(Value::as_i64).unwrap_or(0),
             "private": private,
-            "author": s(i, "/user/login").map(person),
+            "author": public_only(private, json!(s(i, "/user/login").map(person))),
             "url": public_only(private, json!(s(i, "/html_url"))),
             "updated_at": at,
         }),
@@ -185,6 +185,7 @@ pub fn pr_targets(event: &str, p: &Value) -> Vec<(String, String, i64)> {
             .into_iter()
             .flatten()
             .filter_map(|x| x.get("number").and_then(Value::as_i64))
+            .take(10)
             .collect(),
         _ => vec![],
     };
@@ -246,6 +247,7 @@ mod tests {
         assert!(p_acts[0].base["repo"].is_null());
         assert!(p_acts[0].base["message"].is_null());
         assert!(p_acts[0].base["branch"].is_null());
+        assert!(p_acts[0].base["author"].is_null());
         assert!(p_acts[0].base["url"].is_null());
     }
 

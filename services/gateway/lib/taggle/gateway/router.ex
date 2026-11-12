@@ -2,21 +2,17 @@ defmodule Taggle.Gateway.Router do
   @moduledoc false
   use Plug.Router
 
-  require Logger
-
   alias Taggle.Gateway.{
     DiscordAuth,
     DiscordStore,
     Filter,
     GitHubAuth,
     GitHubStore,
-    Ids,
-    Portal
+    Ids
   }
 
   plug :cors
-  plug Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: JSON
-  plug :fetch_cookies
+  plug Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: JSON, length: 2_000_000
   plug :match
   plug :dispatch
 
@@ -26,223 +22,6 @@ defmodule Taggle.Gateway.Router do
 
   get "/health" do
     send_json(conn, 200, %{success: true})
-  end
-
-  get "/" do
-    gh_login =
-      case GitHubAuth.verify_session(conn) do
-        {:ok, login} -> login
-        _ -> nil
-      end
-
-    dc_id =
-      case DiscordAuth.verify_session(conn) do
-        {:ok, id} -> id
-        _ -> nil
-      end
-
-    gh_user =
-      case gh_login && GitHubStore.user_overview(gh_login) do
-        {:ok, user} -> user
-        _ -> nil
-      end
-
-    dc_user = dc_id && DiscordStore.overview(dc_id)
-
-    conn
-    |> Plug.Conn.put_resp_content_type("text/html")
-    |> Plug.Conn.send_resp(200, Portal.render(gh_user, dc_user, GitHubAuth.base_url()))
-  end
-
-  # ---------------------------------------------------------------------
-  # GitHub OAuth
-  # ---------------------------------------------------------------------
-
-  get "/auth/github" do
-    case GitHubAuth.github_authorize_url() do
-      {:ok, url} ->
-        redirect(conn, url)
-
-      {:error, :missing_client_id} ->
-        send_json(conn, 503, %{
-          success: false,
-          error: %{code: "oauth_not_configured", message: "GitHub OAuth is not configured."}
-        })
-    end
-  end
-
-  get "/auth/github/callback" do
-    conn = Plug.Conn.fetch_query_params(conn)
-    code = conn.query_params["code"]
-    state = conn.query_params["state"]
-    installation_id = conn.query_params["installation_id"]
-
-    case GitHubAuth.exchange_code(code, state, installation_id) do
-      {:ok, user} ->
-        login = GitHubStore.upsert_user_from_oauth(user)
-        maybe_record_installation(installation_id, login)
-        trigger_ingest_sync(login, user[:access_token])
-
-        conn
-        |> Plug.Conn.put_resp_cookie(
-          GitHubAuth.session_cookie_name(),
-          GitHubAuth.sign_session(login),
-          GitHubAuth.session_cookie_opts()
-        )
-        |> redirect("/")
-
-      {:error, reason} ->
-        log_oauth_error("github", reason)
-        oauth_failed(conn, "GitHub")
-    end
-  end
-
-  get "/setup" do
-    conn = Plug.Conn.fetch_query_params(conn)
-
-    with {:ok, login} <- GitHubAuth.verify_session(conn) do
-      maybe_record_installation(conn.query_params["installation_id"], login)
-    end
-
-    redirect(conn, "/")
-  end
-
-  post "/auth/logout" do
-    conn
-    |> Plug.Conn.delete_resp_cookie(GitHubAuth.session_cookie_name())
-    |> Plug.Conn.delete_resp_cookie(DiscordAuth.cookie_name())
-    |> redirect("/")
-  end
-
-  post "/auth/github/logout" do
-    conn
-    |> Plug.Conn.delete_resp_cookie(GitHubAuth.session_cookie_name())
-    |> redirect("/")
-  end
-
-  # ---------------------------------------------------------------------
-  # Discord OAuth (only needed to obtain a KV API key)
-  # ---------------------------------------------------------------------
-
-  get "/auth/discord" do
-    case DiscordAuth.authorize_url() do
-      {:ok, url} ->
-        redirect(conn, url)
-
-      {:error, :not_configured} ->
-        send_json(conn, 503, %{
-          success: false,
-          error: %{code: "oauth_not_configured", message: "Discord OAuth is not configured."}
-        })
-    end
-  end
-
-  get "/auth/discord/callback" do
-    conn = Plug.Conn.fetch_query_params(conn)
-    code = conn.query_params["code"]
-    state = conn.query_params["state"]
-
-    case DiscordAuth.exchange_code(code, state) do
-      {:ok, user} ->
-        case DiscordStore.upsert_oauth_user(user) do
-          {:ok, user_id} ->
-            conn
-            |> Plug.Conn.put_resp_cookie(
-              DiscordAuth.cookie_name(),
-              DiscordAuth.sign_session(user_id),
-              DiscordAuth.session_cookie_opts()
-            )
-            |> redirect("/")
-
-          {:error, _} ->
-            oauth_failed(conn, "Discord")
-        end
-
-      {:error, reason} ->
-        log_oauth_error("discord", reason)
-        oauth_failed(conn, "Discord")
-    end
-  end
-
-  post "/auth/discord/logout" do
-    conn
-    |> Plug.Conn.delete_resp_cookie(DiscordAuth.cookie_name())
-    |> redirect("/")
-  end
-
-  # ---------------------------------------------------------------------
-  # Authenticated management (session cookie)
-  # ---------------------------------------------------------------------
-
-  post "/api/me/sync" do
-    with {:ok, login} <- GitHubAuth.verify_session(conn) do
-      trigger_ingest_sync(login, nil)
-      send_json(conn, 200, %{success: true})
-    else
-      _ -> unauthorized(conn)
-    end
-  end
-
-  post "/api/me/api-key" do
-    with {:ok, login} <- GitHubAuth.verify_session(conn),
-         {:ok, key} <- GitHubStore.rotate_api_key(login) do
-      send_json(conn, 200, %{success: true, data: %{api_key: key}})
-    else
-      _ -> unauthorized(conn)
-    end
-  end
-
-  put "/api/me/kv" do
-    with {:ok, login} <- GitHubAuth.verify_session(conn),
-         pairs when is_map(pairs) and not is_struct(pairs) <- conn.body_params,
-         {:ok, kv} <- GitHubStore.put_kv(login, pairs) do
-      send_json(conn, 200, %{success: true, data: kv})
-    else
-      {:error, code} -> bad_request(conn, error_code(code))
-      %Plug.Conn.Unfetched{} -> bad_request(conn, "invalid_json")
-      _ -> unauthorized(conn)
-    end
-  end
-
-  delete "/api/me/kv/:key" do
-    with {:ok, login} <- GitHubAuth.verify_session(conn),
-         {:ok, kv} <- GitHubStore.delete_kv(login, key) do
-      send_json(conn, 200, %{success: true, data: kv})
-    else
-      {:error, code} -> bad_request(conn, error_code(code))
-      _ -> unauthorized(conn)
-    end
-  end
-
-  post "/api/discord/me/api-key" do
-    with {:ok, user_id} <- DiscordAuth.verify_session(conn),
-         {:ok, key} <- DiscordStore.rotate_api_key(user_id) do
-      send_json(conn, 200, %{success: true, data: %{api_key: key}})
-    else
-      _ -> unauthorized(conn)
-    end
-  end
-
-  put "/api/discord/me/kv" do
-    with {:ok, user_id} <- DiscordAuth.verify_session(conn),
-         pairs when is_map(pairs) and not is_struct(pairs) <- conn.body_params,
-         {:ok, kv} <- DiscordStore.put_kv(user_id, pairs) do
-      send_json(conn, 200, %{success: true, data: kv})
-    else
-      {:error, code} -> bad_request(conn, error_code(code))
-      %Plug.Conn.Unfetched{} -> bad_request(conn, "invalid_json")
-      _ -> unauthorized(conn)
-    end
-  end
-
-  delete "/api/discord/me/kv/:key" do
-    with {:ok, user_id} <- DiscordAuth.verify_session(conn),
-         {:ok, kv} <- DiscordStore.delete_kv(user_id, key) do
-      send_json(conn, 200, %{success: true, data: kv})
-    else
-      {:error, code} -> bad_request(conn, error_code(code))
-      _ -> unauthorized(conn)
-    end
   end
 
   # ---------------------------------------------------------------------
@@ -331,7 +110,12 @@ defmodule Taggle.Gateway.Router do
   get "/:file" do
     case String.split(file, ".", parts: 2) do
       [id, ext] when ext in ~w(png gif webp jpg jpeg) ->
-        if Ids.discord_id?(id), do: redirect(conn, discord_avatar_url(id, ext)), else: not_found(conn)
+        with true <- Ids.discord_id?(id),
+             {:ok, %{} = presence} <- DiscordStore.get_presence(id) do
+          redirect(conn, discord_avatar_url(presence, id, ext))
+        else
+          _ -> not_found(conn)
+        end
 
       _ ->
         not_found(conn)
@@ -348,7 +132,11 @@ defmodule Taggle.Gateway.Router do
 
   defp upgrade_socket(conn) do
     conn
-    |> WebSockAdapter.upgrade(Taggle.Gateway.Socket, [], timeout: 60_000, compress: false)
+    |> WebSockAdapter.upgrade(Taggle.Gateway.Socket, [],
+      timeout: 60_000,
+      compress: false,
+      max_frame_size: 65_536
+    )
     |> halt()
   end
 
@@ -399,12 +187,13 @@ defmodule Taggle.Gateway.Router do
   defp github_patch_kv(conn, login) do
     with token when is_binary(token) <- GitHubAuth.extract_api_key(conn),
          true <- GitHubStore.valid_api_key?(login, token),
-         pairs when is_map(pairs) and not is_struct(pairs) <- conn.body_params,
+         pairs when is_map(pairs) and not is_struct(pairs) and not is_map_key(pairs, "_json") <- conn.body_params,
          {:ok, kv} <- GitHubStore.put_kv(login, pairs) do
       send_json(conn, 200, %{success: true, data: kv})
     else
       {:error, code} -> bad_request(conn, error_code(code))
       %Plug.Conn.Unfetched{} -> bad_request(conn, "invalid_json")
+      %{"_json" => _} -> bad_request(conn, "invalid_json")
       _ -> unauthorized(conn)
     end
   end
@@ -435,12 +224,13 @@ defmodule Taggle.Gateway.Router do
   defp discord_patch_kv(conn, user_id) do
     with token when is_binary(token) <- GitHubAuth.extract_api_key(conn),
          true <- DiscordStore.valid_api_key?(user_id, token),
-         pairs when is_map(pairs) and not is_struct(pairs) <- conn.body_params,
+         pairs when is_map(pairs) and not is_struct(pairs) and not is_map_key(pairs, "_json") <- conn.body_params,
          {:ok, kv} <- DiscordStore.put_kv(user_id, pairs) do
       send_json(conn, 200, %{success: true, data: kv})
     else
       {:error, code} -> bad_request(conn, error_code(code))
       %Plug.Conn.Unfetched{} -> bad_request(conn, "invalid_json")
+      %{"_json" => _} -> bad_request(conn, "invalid_json")
       _ -> unauthorized(conn)
     end
   end
@@ -468,40 +258,14 @@ defmodule Taggle.Gateway.Router do
     end
   end
 
-  defp discord_avatar_url(user_id, ext) do
+  defp discord_avatar_url(presence, user_id, ext) do
     avatar =
-      case DiscordStore.get_presence(user_id) do
-        {:ok, %{"discord_user" => %{"avatar" => avatar}}} when is_binary(avatar) and avatar != "" -> avatar
+      case presence do
+        %{"discord_user" => %{"avatar" => avatar}} when is_binary(avatar) and avatar != "" -> avatar
         _ -> nil
       end
 
     DiscordAuth.avatar_url(%{id: user_id, avatar: avatar}) |> String.replace_suffix(".png", "." <> ext)
-  end
-
-  defp maybe_record_installation(nil, _login), do: :ok
-
-  defp maybe_record_installation(id_str, login) do
-    case Integer.parse(to_string(id_str)) do
-      {id, ""} when id > 0 -> GitHubStore.record_installation(id, login)
-      _ -> :ok
-    end
-  end
-
-  defp trigger_ingest_sync(login, oauth_token) do
-    base =
-      System.get_env("INGEST_URL", "http://localhost:4001")
-      |> String.trim_trailing("/")
-
-    body =
-      if is_binary(oauth_token) and oauth_token != "",
-        do: %{login: login, oauth_token: oauth_token},
-        else: %{login: login}
-
-    try do
-      Req.post(base <> "/internal/sync", json: body, receive_timeout: 8_000, retry: false)
-    rescue
-      _ -> :ok
-    end
   end
 
   defp extract_kv_value(%{body_params: %{"value" => v}})
@@ -519,30 +283,10 @@ defmodule Taggle.Gateway.Router do
     end
   end
 
-  defp log_oauth_error(provider, reason) do
-    detail =
-      case reason do
-        {:discord_oauth_status, status} -> "http #{status}"
-        {:error, %{status: status}} -> "http #{status}"
-        %{status: status} -> "http #{status}"
-        atom when is_atom(atom) -> to_string(atom)
-        _ -> "unexpected error"
-      end
-
-    Logger.warning("#{provider} oauth failed: #{detail}")
-  end
-
-  defp oauth_failed(conn, provider) do
-    send_json(conn, 400, %{
-      success: false,
-      error: %{code: "oauth_failed", message: "#{provider} sign-in failed. Please try again."}
-    })
-  end
-
   defp unauthorized(conn) do
     send_json(conn, 401, %{
       success: false,
-      error: %{code: "unauthorized", message: "Sign in or provide a valid API key."}
+      error: %{code: "unauthorized", message: "Provide a valid API key."}
     })
   end
 
@@ -573,6 +317,8 @@ defmodule Taggle.Gateway.Router do
     |> Plug.Conn.put_resp_header("access-control-allow-origin", "*")
     |> Plug.Conn.put_resp_header("access-control-allow-methods", "GET, PUT, PATCH, DELETE, OPTIONS")
     |> Plug.Conn.put_resp_header("access-control-allow-headers", "authorization, content-type")
+    |> Plug.Conn.put_resp_header("x-content-type-options", "nosniff")
+    |> Plug.Conn.put_resp_header("cache-control", "no-store")
   end
 
   defp send_json(conn, status, body) do

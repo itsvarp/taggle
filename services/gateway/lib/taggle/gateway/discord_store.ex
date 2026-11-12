@@ -19,11 +19,8 @@ defmodule Taggle.Gateway.DiscordStore do
 
   def get_presence(user_id) do
     with true <- Ids.discord_id?(user_id),
-         {:ok, raw} <- get_presence_raw(user_id) do
-      case raw do
-        nil -> {:ok, nil}
-        data -> {:ok, Map.put(data, "kv", kv_map(user_id))}
-      end
+         {:ok, data} <- get_presence_raw(user_id) do
+      {:ok, data}
     else
       false -> {:error, :invalid_id}
       {:error, _} = err -> err
@@ -35,7 +32,10 @@ defmodule Taggle.Gateway.DiscordStore do
 
     case Redix.command(:redix, ["GET", key]) do
       {:ok, raw} when is_binary(raw) ->
-        {:ok, JSON.decode!(raw)}
+        case JSON.decode(raw) do
+          {:ok, decoded} -> {:ok, decoded}
+          {:error, _} -> read_through_pg(user_id, key)
+        end
 
       {:ok, nil} ->
         read_through_pg(user_id, key)
@@ -49,6 +49,7 @@ defmodule Taggle.Gateway.DiscordStore do
   defp read_through_pg(user_id, redis_key) do
     case Postgrex.query(:pg, "SELECT data FROM discord_presences WHERE user_id = $1", [user_id]) do
       {:ok, %Postgrex.Result{rows: [[data]]}} ->
+        data = Map.put(data, "kv", kv_map(user_id))
         raw = JSON.encode!(data)
         if redis_key, do: _ = Redix.command(:redix, ["SET", redis_key, raw])
         {:ok, data}
@@ -130,23 +131,6 @@ defmodule Taggle.Gateway.DiscordStore do
     end
   end
 
-  def oauth_user(user_id) do
-    case Postgrex.query(
-           :pg,
-           "SELECT id, username, global_name, avatar, api_key_hash IS NOT NULL FROM discord_users WHERE id = $1",
-           [user_id]
-         ) do
-      {:ok, %Postgrex.Result{rows: [[id, username, global_name, avatar, has_key]]}} ->
-        {:ok, %{id: id, username: username, global_name: global_name, avatar: avatar, has_api_key: has_key}}
-
-      {:ok, %Postgrex.Result{rows: []}} ->
-        :not_found
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
   def rotate_api_key(user_id) when is_binary(user_id) do
     token = @api_key_prefix <> (:crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false))
     hash = sha256_hex(token)
@@ -158,12 +142,16 @@ defmodule Taggle.Gateway.DiscordStore do
   end
 
   def valid_api_key?(user_id, token) when is_binary(token) and byte_size(token) > 0 do
-    case Postgrex.query(:pg, "SELECT api_key_hash FROM discord_users WHERE id = $1", [user_id]) do
-      {:ok, %Postgrex.Result{rows: [[stored]]}} when is_binary(stored) ->
-        Plug.Crypto.secure_compare(stored, sha256_hex(token))
+    if Ids.discord_id?(user_id) do
+      case Postgrex.query(:pg, "SELECT api_key_hash FROM discord_users WHERE id = $1", [user_id]) do
+        {:ok, %Postgrex.Result{rows: [[stored]]}} when is_binary(stored) ->
+          Plug.Crypto.secure_compare(stored, sha256_hex(token))
 
-      _ ->
-        false
+        _ ->
+          false
+      end
+    else
+      false
     end
   end
 
@@ -175,9 +163,10 @@ defmodule Taggle.Gateway.DiscordStore do
 
   def put_kv(user_id, pairs) when is_map(pairs) do
     with true <- Ids.discord_id?(user_id),
-         :ok <- validate_pairs(pairs),
-         :ok <- ensure_pair_budget(user_id, pairs) do
+         :ok <- validate_pairs(pairs) do
       Postgrex.transaction(:pg, fn conn ->
+        Postgrex.query!(conn, "SELECT pg_advisory_xact_lock(hashtext('dckv:' || $1))", [user_id])
+
         for {k, v} <- pairs do
           Postgrex.query!(
             conn,
@@ -187,6 +176,13 @@ defmodule Taggle.Gateway.DiscordStore do
             """,
             [user_id, k, to_string(v)]
           )
+        end
+
+        %Postgrex.Result{rows: [[total]]} =
+          Postgrex.query!(conn, "SELECT count(*) FROM discord_kv WHERE user_id = $1", [user_id])
+
+        if total > @max_kv_pairs do
+          Postgrex.rollback(conn, "too_many_keys")
         end
       end)
       |> case do
@@ -201,13 +197,18 @@ defmodule Taggle.Gateway.DiscordStore do
 
   def delete_kv(user_id, key) when is_binary(key) do
     with true <- Ids.discord_id?(user_id),
-         true <- valid_key?(key) do
-      Postgrex.query!(:pg, "DELETE FROM discord_kv WHERE user_id = $1 AND key = $2", [user_id, key])
+         true <- valid_key?(key),
+         {:ok, _} <- Postgrex.query(:pg, "DELETE FROM discord_kv WHERE user_id = $1 AND key = $2", [user_id, key]) do
       publish_presence(user_id)
     else
       false -> {:error, "invalid_key"}
+      {:error, reason} -> {:error, reason}
     end
   end
+
+  def delete_kv(_, _), do: {:error, "invalid_key"}
+
+  defp validate_pairs(pairs) when map_size(pairs) > 50, do: {:error, "too_many_keys"}
 
   defp validate_pairs(pairs) do
     Enum.reduce_while(pairs, :ok, fn {k, v}, :ok ->
@@ -229,19 +230,6 @@ defmodule Taggle.Gateway.DiscordStore do
 
   defp valid_key?(key) when is_binary(key), do: Regex.match?(~r/^[A-Za-z0-9_]{1,255}$/, key)
   defp valid_key?(_), do: false
-
-  defp ensure_pair_budget(user_id, pairs) do
-    case Postgrex.query(:pg, "SELECT key FROM discord_kv WHERE user_id = $1", [user_id]) do
-      {:ok, %Postgrex.Result{rows: rows}} ->
-        existing = MapSet.new(rows, &hd/1)
-        total = existing |> MapSet.union(MapSet.new(Map.keys(pairs))) |> MapSet.size()
-
-        if total > @max_kv_pairs, do: {:error, "too_many_keys"}, else: :ok
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
 
   @doc """
   Re-merges KV into the stored presence and republishes it so WebSocket clients
@@ -271,22 +259,6 @@ defmodule Taggle.Gateway.DiscordStore do
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  def overview(user_id) do
-    presence =
-      case get_presence(user_id) do
-        {:ok, p} -> p
-        _ -> nil
-      end
-
-    user =
-      case oauth_user(user_id) do
-        {:ok, u} -> u
-        _ -> nil
-      end
-
-    %{presence: presence, user: user, kv: kv_map(user_id)}
   end
 
   defp sha256_hex(s), do: :crypto.hash(:sha256, s) |> Base.encode16(case: :lower)

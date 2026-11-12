@@ -15,8 +15,10 @@ defmodule Taggle.GatewayTest do
       assert Ids.source("bad/../id") == :invalid
       assert Ids.source("-nope") == :invalid
       assert Ids.source("0") == :invalid
+      assert Ids.source("0123") == :invalid
       assert Ids.discord_id?("12345678901234567890")
       refute Ids.discord_id?("123456789012345678901")
+      refute Ids.discord_id?("99999999999999999999")
     end
 
     test "builds Discord CDN avatar URLs" do
@@ -59,6 +61,7 @@ defmodule Taggle.GatewayTest do
       discord_id = "9" <> Integer.to_string(System.unique_integer([:positive]))
 
       on_exit(fn ->
+        Postgrex.query!(:pg, "DELETE FROM discord_github_links WHERE discord_user_id = $1 OR github_login = $2", [discord_id, login])
         Postgrex.query!(:pg, "DELETE FROM snapshots WHERE login = $1", [login])
         Postgrex.query!(:pg, "DELETE FROM user_kv WHERE login = $1", [login])
         Postgrex.query!(:pg, "DELETE FROM installations WHERE account_login = $1", [login])
@@ -73,10 +76,18 @@ defmodule Taggle.GatewayTest do
       %{login: login, id: id, discord_id: discord_id}
     end
 
-    test "health and unknown user return expected JSON" do
+    test "health, root, and unknown user return expected JSON" do
       conn = conn(:get, "/health") |> Router.call(@opts)
       assert conn.status == 200
       assert JSON.decode!(conn.resp_body) == %{"success" => true}
+
+      conn = conn(:get, "/") |> Router.call(@opts)
+      assert conn.status == 404
+      assert JSON.decode!(conn.resp_body)["error"]["code"] == "not_found"
+
+      conn = conn(:get, "/auth/github") |> Router.call(@opts)
+      assert conn.status == 404
+      assert JSON.decode!(conn.resp_body)["error"]["code"] == "not_found"
 
       conn = conn(:get, "/v1/users/definitelynobody999") |> Router.call(@opts)
       assert conn.status == 404
@@ -87,8 +98,21 @@ defmodule Taggle.GatewayTest do
       assert JSON.decode!(conn.resp_body)["error"]["code"] == "not_found"
     end
 
-    test "read-through cache restores Redis from Postgres on miss", %{login: login, id: id} do
+    test "unlinked GitHub user is not served even if snapshot exists", %{login: login, id: id} do
       GitHubStore.upsert_user_from_oauth(%{id: id, login: login, name: "Test", avatar_url: nil})
+
+      conn = conn(:get, "/v1/github/users/" <> login) |> Router.call(@opts)
+      assert conn.status == 404
+      assert JSON.decode!(conn.resp_body)["error"]["code"] == "user_not_monitored"
+    end
+
+    test "read-through cache restores Redis from Postgres on miss", %{login: login, id: id, discord_id: discord_id} do
+      GitHubStore.upsert_user_from_oauth(%{id: id, login: login, name: "Test", avatar_url: nil})
+      Postgrex.query!(
+        :pg,
+        "INSERT INTO discord_github_links (discord_user_id, github_id, github_login) VALUES ($1, $2, $3)",
+        [discord_id, id, login]
+      )
       Redix.command!(:redix, ["DEL", "taggle:state:" <> login])
 
       conn = conn(:get, "/v1/users/" <> login) |> Router.call(@opts)
@@ -101,8 +125,13 @@ defmodule Taggle.GatewayTest do
       assert is_binary(raw)
     end
 
-    test "GitHub KV update requires API key and broadcasts via Redis pubsub", %{login: login, id: id} do
+    test "GitHub KV update requires API key and broadcasts via Redis pubsub", %{login: login, id: id, discord_id: discord_id} do
       GitHubStore.upsert_user_from_oauth(%{id: id, login: login, name: "Test", avatar_url: nil})
+      Postgrex.query!(
+        :pg,
+        "INSERT INTO discord_github_links (discord_user_id, github_id, github_login) VALUES ($1, $2, $3)",
+        [discord_id, id, login]
+      )
       {:ok, api_key} = GitHubStore.rotate_api_key(login)
 
       unauth =
@@ -238,6 +267,11 @@ defmodule Taggle.GatewayTest do
 
       assert bad_key.status == 400
       assert JSON.decode!(bad_key.resp_body)["error"]["code"] == "invalid_key"
+    end
+
+    test "avatar quicklink returns 404 when Discord user is not monitored", %{discord_id: discord_id} do
+      conn = conn(:get, "/#{discord_id}.png") |> Router.call(@opts)
+      assert conn.status == 404
     end
   end
 end
