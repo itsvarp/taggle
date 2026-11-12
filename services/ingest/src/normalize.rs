@@ -20,6 +20,39 @@ pub fn s<'a>(v: &'a Value, ptr: &str) -> Option<&'a str> {
     v.pointer(ptr).and_then(Value::as_str)
 }
 
+/// Validates an `owner/repo` slug against path traversal or unexpected characters.
+pub fn valid_repo_slug(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    if name.contains('/') {
+        return false;
+    }
+    [owner, name].into_iter().all(|part| {
+        !part.is_empty()
+            && part.len() <= 100
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    })
+}
+
+/// Returns up to 7 characters without ever slicing inside a multi-byte UTF-8 character.
+pub fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+/// Truncates text cleanly on a char boundary.
+pub fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
 fn ts(v: &Value, ptr: &str) -> DateTime<Utc> {
     s(v, ptr)
         .and_then(|x| DateTime::parse_from_rfc3339(x).ok())
@@ -32,11 +65,15 @@ pub fn person(login: &str) -> Value {
 }
 
 fn is_private(p: &Value) -> bool {
-    p.pointer("/repository/private").and_then(Value::as_bool).unwrap_or(false)
+    p.pointer("/repository/private")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn repo_name(p: &Value) -> Option<String> {
-    s(p, "/repository/full_name").map(str::to_owned)
+    s(p, "/repository/full_name")
+        .filter(|repo| valid_repo_slug(repo))
+        .map(str::to_owned)
 }
 
 /// Keeps `value` unless the repo is private.
@@ -47,10 +84,19 @@ fn public_only(private: bool, value: Value) -> Value {
 pub fn from_event(event: &str, p: &Value) -> Vec<Act> {
     match event {
         "push" => push(p),
-        "pull_request" | "pull_request_review" | "pull_request_review_thread" | "pull_request_review_comment" => {
-            p.get("pull_request").and_then(|pr| pull_request(p, pr)).into_iter().collect()
-        }
-        "issues" => p.get("issue").and_then(|i| issue(p, i)).into_iter().collect(),
+        "pull_request"
+        | "pull_request_review"
+        | "pull_request_review_thread"
+        | "pull_request_review_comment" => p
+            .get("pull_request")
+            .and_then(|pr| pull_request(p, pr))
+            .into_iter()
+            .collect(),
+        "issues" => p
+            .get("issue")
+            .and_then(|i| issue(p, i))
+            .into_iter()
+            .collect(),
         // Comments on PRs arrive as issue_comment; those only need enrichment, not an issue row.
         "issue_comment" => match p.get("issue") {
             Some(i) if i.get("pull_request").is_none() => issue(p, i).into_iter().collect(),
@@ -64,7 +110,9 @@ fn push(p: &Value) -> Vec<Act> {
     if p.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
         return vec![];
     }
-    let (Some(repo), Some(git_ref)) = (repo_name(p), s(p, "/ref")) else { return vec![] };
+    let (Some(repo), Some(git_ref)) = (repo_name(p), s(p, "/ref")) else {
+        return vec![];
+    };
     let branch = git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref);
     let private = is_private(p);
 
@@ -75,9 +123,13 @@ fn push(p: &Value) -> Vec<Act> {
         .take(20)
         .filter_map(|c| {
             let sha = s(c, "/id")?;
-            let short = &sha[..sha.len().min(7)];
+            if sha.is_empty() || sha.len() > 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let short = short_sha(sha);
             let author = s(c, "/author/username").or_else(|| s(c, "/committer/username"));
-            let message = s(c, "/message").map(|m| m.lines().next().unwrap_or("").to_owned());
+            let message =
+                s(c, "/message").map(|m| truncate_chars(m.lines().next().unwrap_or(""), 500));
             Some(Act {
                 kind: "commit",
                 key: format!("{repo}@{sha}"),
@@ -103,7 +155,11 @@ fn pull_request(p: &Value, pr: &Value) -> Option<Act> {
     let number = pr.get("number")?.as_i64()?;
     let private = is_private(p);
     let merged = pr.get("merged").and_then(Value::as_bool).unwrap_or(false);
-    let state = if merged { "merged" } else { s(pr, "/state").unwrap_or("open") };
+    let state = if merged {
+        "merged"
+    } else {
+        s(pr, "/state").unwrap_or("open")
+    };
     let at = ts(pr, "/updated_at");
 
     Some(Act {
@@ -118,7 +174,7 @@ fn pull_request(p: &Value, pr: &Value) -> Option<Act> {
         base: json!({
             "id": number,
             "number": number,
-            "title": public_only(private, json!(s(pr, "/title"))),
+            "title": public_only(private, json!(s(pr, "/title").map(|t| truncate_chars(t, 500)))),
             "repo": public_only(private, json!(repo)),
             "branch": public_only(private, json!(s(pr, "/head/ref"))),
             "state": state,
@@ -152,7 +208,7 @@ fn issue(p: &Value, i: &Value) -> Option<Act> {
         defaults: Value::Null,
         base: json!({
             "number": number,
-            "title": public_only(private, json!(s(i, "/title"))),
+            "title": public_only(private, json!(s(i, "/title").map(|t| truncate_chars(t, 500)))),
             "repo": public_only(private, json!(repo)),
             "state": s(i, "/state").unwrap_or("open"),
             "labels": if private { json!([]) } else { Value::Array(labels) },
@@ -169,16 +225,27 @@ fn issue(p: &Value, i: &Value) -> Option<Act> {
 /// Pull requests whose enrichment (review threads, checks) should be refreshed.
 /// Returns (owner, repo, number).
 pub fn pr_targets(event: &str, p: &Value) -> Vec<(String, String, i64)> {
-    let Some(full) = s(p, "/repository/full_name") else { return vec![] };
-    let Some((owner, repo)) = full.split_once('/') else { return vec![] };
+    let Some(full) = s(p, "/repository/full_name").filter(|r| valid_repo_slug(r)) else {
+        return vec![];
+    };
+    let Some((owner, repo)) = full.split_once('/') else {
+        return vec![];
+    };
 
     let numbers: Vec<i64> = match event {
-        "pull_request" | "pull_request_review" | "pull_request_review_thread" | "pull_request_review_comment" => {
-            p.pointer("/pull_request/number").and_then(Value::as_i64).into_iter().collect()
-        }
-        "issue_comment" if p.pointer("/issue/pull_request").is_some() => {
-            p.pointer("/issue/number").and_then(Value::as_i64).into_iter().collect()
-        }
+        "pull_request"
+        | "pull_request_review"
+        | "pull_request_review_thread"
+        | "pull_request_review_comment" => p
+            .pointer("/pull_request/number")
+            .and_then(Value::as_i64)
+            .into_iter()
+            .collect(),
+        "issue_comment" if p.pointer("/issue/pull_request").is_some() => p
+            .pointer("/issue/number")
+            .and_then(Value::as_i64)
+            .into_iter()
+            .collect(),
         "check_run" | "check_suite" => p
             .pointer(&format!("/{}/pull_requests", event))
             .and_then(Value::as_array)
@@ -189,7 +256,10 @@ pub fn pr_targets(event: &str, p: &Value) -> Vec<(String, String, i64)> {
             .collect(),
         _ => vec![],
     };
-    numbers.into_iter().map(|n| (owner.to_owned(), repo.to_owned(), n)).collect()
+    numbers
+        .into_iter()
+        .map(|n| (owner.to_owned(), repo.to_owned(), n))
+        .collect()
 }
 
 /// Shallow-merges `b` over `a` (both objects). Non-objects: `b` wins unless null.
@@ -277,6 +347,28 @@ mod tests {
             "issue": { "number": 42, "pull_request": { "url": "..." } }
         });
         assert!(from_event("issue_comment", &pr_comment).is_empty());
-        assert_eq!(pr_targets("issue_comment", &pr_comment), vec![("example-user".into(), "demo-repo".into(), 42)]);
+        assert_eq!(
+            pr_targets("issue_comment", &pr_comment),
+            vec![("example-user".into(), "demo-repo".into(), 42)]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_repo_slugs_and_non_hex_sha_safely() {
+        let bad_repo = json!({
+            "ref": "refs/heads/main",
+            "repository": { "full_name": "evil/../path", "private": false },
+            "commits": [{ "id": "abcdef1234", "message": "hi" }]
+        });
+        assert!(from_event("push", &bad_repo).is_empty());
+        assert!(pr_targets("pull_request", &bad_repo).is_empty());
+
+        let utf8_sha = json!({
+            "ref": "refs/heads/main",
+            "repository": { "full_name": "user/repo", "private": false },
+            "commits": [{ "id": "üğişçöüğiş", "message": "hi" }]
+        });
+        assert!(from_event("push", &utf8_sha).is_empty());
+        assert_eq!(short_sha("üğişçöüğiş"), "üğişçöü");
     }
 }

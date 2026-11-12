@@ -36,10 +36,16 @@ or both to make it useful.
 
 | Endpoint | What it is |
 |---|---|
-| `http://localhost:4000/` | Portal: connect accounts, create API keys |
-| `http://localhost:4000/v1/...` | REST API |
-| `http://localhost:4000/socket` | WebSocket |
-| `http://localhost:4001/health` | Ingest worker health |
+| `http://localhost:4000/v1/users/:id` | REST API (auto-detects Discord ID or GitHub login) |
+| `http://localhost:4000/v1/profiles/:id` | Unified `{discord, github}` profile endpoint |
+| `http://localhost:4000/v1/users/:id/card.svg` | Built-in pure-vector SVG status card (`/badge.svg` for pill badge) |
+| `http://localhost:4000/taggle.js` | Self-hosted `TaggleClient` & `<taggle-card>` Web Component |
+| `http://localhost:4000/socket` | WebSocket (`INIT_STATE`, `PRESENCE_UPDATE`, `ACTIVITY_UPDATE`) |
+| `http://localhost:4000/health` & `/metrics` | Gateway Postgres+Redis health & Prometheus metrics |
+| `http://localhost:4001/health` & `/metrics` | Ingest Postgres+Redis health & Prometheus metrics |
+
+Account linking (`/connect`), API keys (`/apikey`), KV (`/kv`), and status checks
+(`/status`) work directly via Discord bot slash commands.
 
 The compose file binds every port to `127.0.0.1`, so nothing is exposed to the
 network by default. In production, put a reverse proxy in front of the gateway.
@@ -68,11 +74,14 @@ The unified route picks the source by looking at the id:
 
 ```http
 GET /v1/users/:id
+GET /v1/profiles/:id
 ```
 
 All digits means a Discord snowflake. Anything else is treated as a GitHub
 login. A GitHub username that happens to be entirely numeric is ambiguous and
-resolves to Discord; use the explicit route for those. You can also be explicit:
+resolves to Discord; use the explicit route for those. `/v1/profiles/:id`
+returns `{ "discord": ..., "github": ... }` when accounts are linked via
+Discord `/connect`. You can also be explicit:
 
 ```http
 GET /v1/discord/users/:user_id
@@ -135,6 +144,8 @@ The fields map directly to what Discord sends:
   status, `5` competing. Most widgets skip type `4`.
 - `listening_to_spotify` and `spotify` are convenience fields built from the
   Spotify activity, so you don't have to parse `activities` yourself.
+- `coding` is a convenience object (e.g. `{"editor", "file", "workspace"}`)
+  when an IDE Rich Presence (VS Code, Neovim, Cursor, Zed, JetBrains, etc.) is active.
 - `active_on_discord_desktop`, `active_on_discord_mobile` and
   `active_on_discord_web` tell you where the person is online.
 - `kv` is the user's key-value store, described below.
@@ -277,9 +288,9 @@ type and timestamp, but `repo`, `title`, `message`, `branch` and `url` are
 ### How GitHub data stays fresh
 
 If you configure a GitHub App webhook, pushes and pull requests show up almost
-immediately. Without webhooks, `ingest` polls on an interval
-(`SYNC_INTERVAL_SECS`, default `180`, minimum `30`). Polling is enough for a
-portfolio; webhooks are better if you want a live feed.
+immediately. Without webhooks (or for public commits), `ingest` runs an adaptive
+ETag-backed poller (`SYNC_INTERVAL_SECS`, default `60`, minimum `5`) backed by
+Redis L2 ETag caching, automatically skipping redundant polls right after fresh webhooks.
 
 ## KV store
 
@@ -290,10 +301,9 @@ are pushed over the WebSocket.
 
 To write to it you need an API key:
 
-1. Open the portal at `/`.
-2. Connect Discord and/or GitHub.
-3. Press **Create API key**. The key is shown once; only a SHA-256 hash is
-   stored. Creating a new key replaces the old one.
+1. Join a monitored Discord server and run `/apikey` (ephemeral response — only you see it).
+2. Optionally run `/connect <github_username>` to link your GitHub account.
+3. Creating a new key rotates and replaces the old one; only a SHA-256 hash is stored. You can also run `/kv set`, `/kv delete`, and `/kv list` directly in Discord.
 
 Send it as a bearer token:
 
@@ -371,6 +381,34 @@ GET /:discord_id.png
 The server looks up the avatar and redirects to Discord's CDN. `png`, `gif`,
 `webp`, `jpg` and `jpeg` are accepted. GitHub snapshots already include
 `avatar_url`, so there's no separate quicklink route for them.
+
+## Embeddable SVG cards, badges & browser SDK
+
+Taggle serves built-in, zero-external-dependency SVG widgets directly from the gateway:
+
+```http
+GET /v1/users/:id/card.svg?theme=dark&accent=58a6ff&compact=false&hide_github=false
+GET /v1/profiles/:id/card.svg
+GET /v1/users/:id/badge.svg
+```
+
+- Supported themes: `dark` (default), `light`, `midnight`, `catppuccin`.
+- Pure vector (built-in monogram avatar, zero third-party image proxies or external URLs), strict XML escaping, and `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`.
+
+For live WebSocket widgets in web pages without external libraries, embed Taggle's self-hosted Web Component & SDK:
+
+```html
+<script type="module" src="https://taggle.example.com/taggle.js"></script>
+<taggle-card subject="123456789012345678" theme="dark"></taggle-card>
+```
+
+Or use `TaggleClient` programmatically:
+
+```js
+import { TaggleClient } from "https://taggle.example.com/taggle.js";
+const client = new TaggleClient({ ids: ["123456789012345678", "octocat"] });
+client.on("update", (data) => console.log(data));
+```
 
 ## WebSocket
 
@@ -471,12 +509,14 @@ Bad input doesn't disconnect you. You get an error event instead:
 | `unknown_opcode` | The `op` isn't one of the supported values |
 | `requires_data_object` | `op: 2` or `op: 4` arrived without a `d` object |
 | `invalid_payload` | Bad JSON, an invalid id, or an empty subscription |
+| `rate_limited` | Inbound frame rate limit exceeded (closes with `4008` on sustained flood) |
 
 Limits:
 
 - 20 explicit ids per socket.
 - 500 presences for `subscribe_to_all`.
 - 1 MiB per inbound text frame.
+- 40 inbound frames / 10s soft limit (100 frames / 10s hard disconnect with code `4008`).
 
 ## Self-hosting
 
@@ -496,24 +536,23 @@ your secrets manager.
 
 | Variable | Used by | Notes |
 |---|---|---|
-| `BASE_URL` | gateway | Public URL, e.g. `https://taggle.example.com`. Used for OAuth redirects and cookies. |
-| `SESSION_SECRET` | gateway | At least 16 characters. Set it in production, or sessions reset on restart. |
 | `PORT` | gateway | Default `4000`. |
 | `DATABASE_URL` | both | Defaults to the compose Postgres. |
 | `REDIS_URL` | both | Defaults to the compose Redis. |
-| `INGEST_URL` | gateway | Internal URL of the ingest worker. |
 | `INGEST_PORT` | ingest | Default `4001`. |
-| `SYNC_INTERVAL_SECS` | ingest | GitHub polling interval. Default `180`, minimum `30`. |
+| `SYNC_INTERVAL_SECS` | ingest | GitHub adaptive polling interval. Default `60`, minimum `5`. Skips redundant polling right after fresh webhooks. |
+| `RATE_LIMIT_READ_RPM` | gateway | Per-IP REST/SVG/WS requests per minute. Default `120`. |
+| `RATE_LIMIT_KV_RPM` | gateway | Per-IP KV write requests per minute. Default `30`. |
+| `TRUST_PROXY` | gateway | Set `true` behind a reverse proxy so rate limits inspect `x-forwarded-for`. |
+| `METRICS_TOKEN` | gateway | Optional bearer token guarding `GET /metrics`. |
 
 Discord:
 
 | Variable | Notes |
 |---|---|
-| `DISCORD_BOT_TOKEN` | Bot token. Presence isn't monitored without it. |
-| `DISCORD_GUILD_IDS` | Comma-separated server ids to monitor. Empty means every server the bot is in. |
-| `DISCORD_CLIENT_ID` | OAuth client id. Only needed for Discord KV API keys. |
-| `DISCORD_CLIENT_SECRET` | OAuth client secret. Only needed for Discord KV API keys. |
-| `DISCORD_INVITE_URL` | Optional invite link shown in the portal. |
+| `DISCORD_BOT_TOKEN` | Bot token (`ingest` only). Presence isn't monitored without it. |
+| `DISCORD_APP_ID` | Optional override for slash command registration (`/connect`, `/apikey`, `/kv`, `/status`). |
+| `DISCORD_GUILD_IDS` | Comma-separated server ids to monitor and register guild commands on. Empty means every server the bot is in. |
 
 GitHub:
 
@@ -522,9 +561,6 @@ GitHub:
 | `GITHUB_APP_ID` | App id. |
 | `GITHUB_APP_PRIVATE_KEY` | App private key in PEM format. Literal `\n` escapes are accepted. |
 | `GITHUB_WEBHOOK_SECRET` | Secret you set on the GitHub App webhook. Required when the app is configured. |
-| `GITHUB_APP_CLIENT_ID` | OAuth client id, for the portal's Connect GitHub flow. |
-| `GITHUB_APP_CLIENT_SECRET` | OAuth client secret. |
-| `GITHUB_APP_SLUG` | Optional. Used to build the app install link. |
 
 ### Discord bot
 
@@ -532,56 +568,40 @@ GitHub:
    <https://discord.com/developers/applications>.
 2. Open **Bot** and enable **Presence Intent** and **Server Members Intent**
    under Privileged Gateway Intents. Presence does not arrive without them.
-3. Invite the bot to your server with the `bot` scope. It doesn't need
-   moderation permissions; it only needs to be a member.
+3. Invite the bot to your server with the `bot` and `applications.commands` scopes.
 4. Set `DISCORD_BOT_TOKEN`. Set `DISCORD_GUILD_IDS` if the bot is in more than
-   one server and you only want one monitored.
-5. For KV API keys, add `${BASE_URL}/auth/discord/callback` under **OAuth2 →
-   Redirects** and set the client id and secret.
+   one server and you only want one monitored (also speeds up slash command registration).
 
-That's it. Members don't need to authorize anything; joining the server is
-enough.
+Members can use `/connect <github_username>`, `/apikey`, `/kv`, and `/status` directly in Discord.
 
 ### GitHub App
 
 1. Create an app under **Settings → Developer settings → GitHub Apps**.
-2. Set **Homepage URL** to `${BASE_URL}`.
-3. Set **Callback URL** to `${BASE_URL}/auth/github/callback`.
-4. If you want instant updates, set **Webhook URL** to
+2. Set **Webhook URL** to
    `${BASE_URL}/webhooks/github` and pick a secret. The webhook has to reach the
    ingest worker; proxy that one path to port `4001`.
-5. Grant read-only repository permissions: **Metadata**, **Contents**, **Pull
+3. Grant read-only repository permissions: **Metadata**, **Contents**, **Pull
    requests**, **Issues**, **Checks**, **Commit statuses**, **Deployments**.
-6. Subscribe to events: **Push**, **Pull request**, **Pull request review**,
+4. Subscribe to events: **Push**, **Pull request**, **Pull request review**,
    **Pull request review thread**, **Pull request review comment**, **Issues**,
    **Issue comment**, **Check run**, **Deployment status**, **Installation**,
    **Installation repositories**.
-7. Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`,
-   `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET` and, optionally,
-   `GITHUB_APP_SLUG`.
-8. Install the app on your account or organization, then open the portal and
-   connect GitHub.
+5. Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, and `GITHUB_WEBHOOK_SECRET`.
+6. Install the app on your account or organization, then run `/connect <github_username>` in Discord.
 
-Without webhooks, Taggle still works; it just polls every few minutes.
+Without webhooks, Taggle still works via adaptive ETag polling (`SYNC_INTERVAL_SECS`).
 
 ### Start the stack
 
 ```bash
-export BASE_URL=https://taggle.example.com
-export SESSION_SECRET="$(openssl rand -hex 32)"
-
 # Discord (optional)
 export DISCORD_BOT_TOKEN="..."
 export DISCORD_GUILD_IDS="..."
-export DISCORD_CLIENT_ID="..."
-export DISCORD_CLIENT_SECRET="..."
 
 # GitHub (optional)
 export GITHUB_APP_ID="..."
 export GITHUB_APP_PRIVATE_KEY="$(cat your-app.private-key.pem)"
 export GITHUB_WEBHOOK_SECRET="..."
-export GITHUB_APP_CLIENT_ID="..."
-export GITHUB_APP_CLIENT_SECRET="..."
 
 docker compose up -d --build
 docker compose logs -f
@@ -608,17 +628,23 @@ GitHub routes work normally.
 
 - The Discord bot token only exists in `ingest`. The gateway never receives it.
 - GitHub webhook signatures are checked with a constant-time HMAC comparison,
-  and deliveries are deduplicated by delivery id.
-- Discord ids and GitHub logins are validated before being used in Redis keys.
-  SQL is parameterized.
-- API keys are `tggl_` plus 32 random bytes. Only a SHA-256 hash is stored, and
-  comparisons use `Plug.Crypto.secure_compare/2`.
-- OAuth `state` values are single-use with a 10-minute TTL.
-- Session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` over HTTPS.
+  deliveries are deduplicated by validated delivery id, and processor concurrency
+  sheds load with `503` when saturated.
+- Discord ids, interaction tokens, avatar hashes, and GitHub logins/repo slugs
+  are strictly validated before DB/Redis use; Discord `activities` strip raw `session_id`s.
+- All SQL is parameterized and presence/KV state writes serialize cleanly with Postgres
+  advisory locks + atomic Redis Lua string-splice merges.
+- API keys use `tggl_` + 32 CSPRNG bytes. Tokens fail a fast format check before
+  database lookup; only a SHA-256 hash is stored, and comparisons use
+  `Plug.Crypto.secure_compare/2`.
+- Built-in Redis/ETS fixed-window rate limiting guards all read and KV routes (`429 rate_limited`),
+  and WebSocket sockets enforce per-connection inbound rate limits (`ERROR rate_limited` / close `4008`).
+- Built-in SVG cards/badges are pure-vector (no external images/fonts), XML-escaped,
+  and served with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`.
+- Prometheus `/metrics` is available on both `gateway` (`4000`) and `ingest` (`4001`),
+  and `GET /health` verifies live Postgres + Redis connectivity.
 - CORS is open for public reads. Authenticated writes use a bearer token, not a
   cookie, so a browser on another origin can't write on your behalf.
-- There is no built-in rate limiting. If the API is public, add a limit at your
-  reverse proxy.
 
 ### Presence is public
 
@@ -639,12 +665,13 @@ Start the services with the environment variables from the configuration
 section. The Makefile also has `make ingest` and `make gateway` targets for a
 local setup that injects secrets with Infisical.
 
-The two services live in:
+The repository layout:
 
 ```text
-services/ingest      Rust: Discord Gateway, GitHub webhooks, normalization
-services/gateway     Elixir: REST, WebSocket, OAuth, KV, portal
-migrations/          Postgres schema
+services/ingest      Rust: Discord Gateway, slash commands, GitHub webhooks & sync, /metrics
+services/gateway     Elixir: REST, WebSocket, KV, SVG embeds, /taggle.js, rate limit, /metrics
+sdk/                 First-party browser SDK & <taggle-card> Web Component
+migrations/          Postgres schema & indexes
 ```
 
 `mix test` expects the local Postgres and Redis from `make up-db` to be running.
@@ -654,13 +681,14 @@ migrations/          Postgres schema
 A few things are intentionally simple:
 
 - Presence is only available for members the bot can see. Invisible members
-  don't appear, and on startup only currently online members are reported.
-- After a bot restart, Discord only sends the presences that are online at that
-  moment. An entry can stay "online" until the next presence event corrects it.
+  don't appear; on startup `GUILD_CREATE`, previously cached members absent from
+  the initial online list are reconciled to `offline`.
 - GitHub updates without webhooks are delayed by the polling interval.
 - There's no per-user authentication for reads. The API is public by design, or
-  private because you put it behind something that isn't.
-- Rate limiting is left to the proxy.
+  private because you put it behind an internal network or allowlist.
+- Built-in rate limiting enforces per-IP limits (`RATE_LIMIT_READ_RPM`,
+  `RATE_LIMIT_KV_RPM`) and WebSocket frame limits; add edge protection at your
+  reverse proxy if exposed directly to untrusted traffic.
 
 ---
 

@@ -50,6 +50,7 @@ struct BotContext {
     application_id: Mutex<Option<String>>,
     registered_guilds: Mutex<HashSet<String>>,
     guild_members: Mutex<HashMap<String, HashSet<String>>>,
+    guild_online: Mutex<HashMap<String, HashSet<String>>>,
     pending_connects: Mutex<HashMap<String, (u64, AbortHandle)>>,
     connect_cooldowns: Mutex<HashMap<String, Instant>>,
     presence_txs: Vec<tokio::sync::mpsc::Sender<PresenceJob>>,
@@ -71,7 +72,11 @@ impl BotContext {
                 while let Some(job) = rx.recv().await {
                     match job {
                         PresenceJob::Upsert(user_id, presence) => {
-                            if let Err(err) = app_worker.store.upsert_discord_presence(&user_id, &presence).await {
+                            if let Err(err) = app_worker
+                                .store
+                                .upsert_discord_presence(&user_id, &presence)
+                                .await
+                            {
                                 tracing::warn!(error = %err, user_id, "failed storing discord presence");
                             }
                         }
@@ -79,7 +84,10 @@ impl BotContext {
                             if let Err(err) = app_worker.store.purge_discord_user(&user_id).await {
                                 tracing::warn!(error = %err, user_id, "failed purging discord user");
                             } else {
-                                tracing::info!(user_id, "purged data for user not in monitored discord server");
+                                tracing::info!(
+                                    user_id,
+                                    "purged data for user not in monitored discord server"
+                                );
                             }
                         }
                     }
@@ -93,6 +101,7 @@ impl BotContext {
             application_id: Mutex::new(None),
             registered_guilds: Mutex::new(HashSet::new()),
             guild_members: Mutex::new(HashMap::new()),
+            guild_online: Mutex::new(HashMap::new()),
             pending_connects: Mutex::new(HashMap::new()),
             connect_cooldowns: Mutex::new(HashMap::new()),
             presence_txs,
@@ -108,13 +117,20 @@ impl BotContext {
         h % PRESENCE_SHARDS
     }
 
-    fn enqueue_presence(&self, user_id: String, presence: Value) {
+    fn enqueue_presence(&self, app: &App, user_id: String, presence: Value) {
         let idx = Self::shard_for(&user_id);
         if self.presence_txs[idx]
             .try_send(PresenceJob::Upsert(user_id, presence))
             .is_err()
         {
+            app.metrics
+                .discord_presence_dropped
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!("discord presence queue full; dropping stale update");
+        } else {
+            app.metrics
+                .discord_presence_updates
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -147,11 +163,41 @@ impl BotContext {
     }
 
     fn set_guild_members(&self, guild_id: &str, members: HashSet<String>) {
-        self.guild_members.lock().unwrap().insert(guild_id.to_owned(), members);
+        self.guild_members
+            .lock()
+            .unwrap()
+            .insert(guild_id.to_owned(), members);
+    }
+
+    fn set_guild_online(&self, guild_id: &str, online: HashSet<String>) {
+        self.guild_online
+            .lock()
+            .unwrap()
+            .insert(guild_id.to_owned(), online);
+    }
+
+    fn update_guild_online(&self, guild_id: &str, user_id: &str, status: &str) {
+        let mut map = self.guild_online.lock().unwrap();
+        let set = map.entry(guild_id.to_owned()).or_default();
+        if status == "offline" {
+            set.remove(user_id);
+        } else {
+            set.insert(user_id.to_owned());
+        }
+    }
+
+    fn all_online_users(&self) -> Vec<String> {
+        let map = self.guild_online.lock().unwrap();
+        let mut out = HashSet::new();
+        for set in map.values() {
+            out.extend(set.iter().cloned());
+        }
+        out.into_iter().collect()
     }
 
     fn remove_guild(&self, guild_id: &str) {
         self.guild_members.lock().unwrap().remove(guild_id);
+        self.guild_online.lock().unwrap().remove(guild_id);
         self.registered_guilds.lock().unwrap().remove(guild_id);
     }
 
@@ -166,6 +212,9 @@ impl BotContext {
 
     fn remove_guild_member(&self, guild_id: &str, user_id: &str) {
         if let Some(set) = self.guild_members.lock().unwrap().get_mut(guild_id) {
+            set.remove(user_id);
+        }
+        if let Some(set) = self.guild_online.lock().unwrap().get_mut(guild_id) {
             set.remove(user_id);
         }
     }
@@ -245,7 +294,12 @@ pub fn spawn(app: Arc<App>) {
 
         loop {
             let was_resuming = state.session_id.is_some();
-            match run_once(&app, &ctx, &mut state).await {
+            app.metrics
+                .discord_reconnects
+                .fetch_add(1, Ordering::Relaxed);
+            let res = run_once(&app, &ctx, &mut state).await;
+            app.metrics.discord_connected.store(0, Ordering::Relaxed);
+            match res {
                 Ok(()) => {
                     tracing::warn!("discord gateway closed, reconnecting");
                     backoff = 1;
@@ -267,7 +321,11 @@ pub fn spawn(app: Arc<App>) {
 }
 
 async fn run_once(app: &Arc<App>, ctx: &Arc<BotContext>, state: &mut GatewayState) -> Result<()> {
-    let discord = app.config.discord.as_ref().context("discord config missing")?;
+    let discord = app
+        .config
+        .discord
+        .as_ref()
+        .context("discord config missing")?;
 
     let url = match (&state.session_id, &state.resume_url) {
         (Some(_), Some(resume)) if is_discord_gateway_url(resume) => {
@@ -276,7 +334,9 @@ async fn run_once(app: &Arc<App>, ctx: &Arc<BotContext>, state: &mut GatewayStat
         _ => GATEWAY_URL.to_owned(),
     };
 
-    let (socket, _) = connect_async(&url).await.context("discord gateway connect failed")?;
+    let (socket, _) = connect_async(&url)
+        .await
+        .context("discord gateway connect failed")?;
     let (mut write, mut read) = socket.split();
 
     // First frame must be Hello (op 10). Anything else is a protocol violation.
@@ -304,7 +364,9 @@ async fn run_once(app: &Arc<App>, ctx: &Arc<BotContext>, state: &mut GatewayStat
                 "seq": state.seq,
             }
         });
-        write.send(Message::Text(payload.to_string().into())).await?;
+        write
+            .send(Message::Text(payload.to_string().into()))
+            .await?;
         tracing::info!("discord gateway resuming");
     } else {
         let payload = json!({
@@ -315,7 +377,9 @@ async fn run_once(app: &Arc<App>, ctx: &Arc<BotContext>, state: &mut GatewayStat
                 "properties": { "os": "linux", "browser": "taggle", "device": "taggle" },
             }
         });
-        write.send(Message::Text(payload.to_string().into())).await?;
+        write
+            .send(Message::Text(payload.to_string().into()))
+            .await?;
         tracing::info!("discord gateway identifying");
     }
 
@@ -401,20 +465,32 @@ async fn handle_dispatch(
     state: &mut GatewayState,
     value: &Value,
 ) -> Result<()> {
-    let Some(event) = value.get("t").and_then(Value::as_str) else { return Ok(()) };
+    let Some(event) = value.get("t").and_then(Value::as_str) else {
+        return Ok(());
+    };
     let data = value.get("d").unwrap_or(&Value::Null);
 
     match event {
         "READY" => {
-            state.session_id = data.get("session_id").and_then(Value::as_str).map(str::to_owned);
-            state.resume_url = data.get("resume_gateway_url").and_then(Value::as_str).map(str::to_owned);
+            app.metrics.discord_connected.store(1, Ordering::Relaxed);
+            state.session_id = data
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            state.resume_url = data
+                .get("resume_gateway_url")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             if let Some(app_id) = data.pointer("/application/id").and_then(Value::as_str) {
                 *ctx.application_id.lock().unwrap() = Some(app_id.to_owned());
                 spawn_command_registration(app, ctx, app_id.to_owned());
             }
             tracing::info!("discord gateway ready");
         }
-        "RESUMED" => tracing::info!("discord gateway session resumed"),
+        "RESUMED" => {
+            app.metrics.discord_connected.store(1, Ordering::Relaxed);
+            tracing::info!("discord gateway session resumed");
+        }
         "GUILD_CREATE" => {
             let Some(guild_id) = data.get("id").and_then(Value::as_str) else {
                 return Ok(());
@@ -422,7 +498,12 @@ async fn handle_dispatch(
             if !guild_allowed(app, Some(guild_id)) {
                 return Ok(());
             }
-            if app.config.discord.as_ref().is_some_and(|d| d.guild_ids.is_empty()) {
+            if app
+                .config
+                .discord
+                .as_ref()
+                .is_some_and(|d| d.guild_ids.is_empty())
+            {
                 let app_id = ctx.application_id.lock().unwrap().clone();
                 if let Some(app_id) = app_id {
                     ensure_guild_commands(app, ctx, app_id, guild_id.to_owned());
@@ -434,32 +515,56 @@ async fn handle_dispatch(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|m| m.pointer("/user/id").and_then(Value::as_str).map(|id| (id, m)))
+                .filter_map(|m| {
+                    m.pointer("/user/id")
+                        .and_then(Value::as_str)
+                        .map(|id| (id, m))
+                })
                 .collect();
 
-            let mut member_ids: HashSet<String> = members.keys().map(|id| (*id).to_owned()).collect();
-            for presence in data.get("presences").and_then(Value::as_array).into_iter().flatten() {
+            let mut member_ids: HashSet<String> =
+                members.keys().map(|id| (*id).to_owned()).collect();
+            let mut online_ids: HashSet<String> = HashSet::new();
+            for presence in data
+                .get("presences")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 if let Some(id) = presence.pointer("/user/id").and_then(Value::as_str) {
                     member_ids.insert(id.to_owned());
+                    if presence.get("status").and_then(Value::as_str) != Some("offline") {
+                        online_ids.insert(id.to_owned());
+                    }
                 }
                 let member = presence
                     .pointer("/user/id")
                     .and_then(Value::as_str)
                     .and_then(|id| members.get(id).copied());
                 if let Some((uid, normalized)) = normalize_presence(presence, member) {
-                    ctx.enqueue_presence(uid, normalized);
+                    ctx.enqueue_presence(app, uid, normalized);
                 }
             }
 
             let member_count = data.get("member_count").and_then(Value::as_u64);
             let complete_snapshot = member_count.is_some_and(|c| c as usize <= member_ids.len());
+            let guild_member_list: Vec<String> = member_ids.iter().cloned().collect();
             ctx.set_guild_members(guild_id, member_ids);
+            ctx.set_guild_online(guild_id, online_ids);
+            let all_online = ctx.all_online_users();
 
             let app_bg = Arc::clone(app);
             let ctx_bg = Arc::clone(ctx);
             let gid_bg = guild_id.to_owned();
             tokio::spawn(async move {
                 reconcile_guild_members(&app_bg, &ctx_bg, &gid_bg, complete_snapshot).await;
+                if let Err(err) = app_bg
+                    .store
+                    .reconcile_offline_presences(&guild_member_list, &all_online)
+                    .await
+                {
+                    tracing::warn!(error = %err, guild_id = %gid_bg, "failed reconciling offline presences");
+                }
             });
         }
         "PRESENCE_UPDATE" => {
@@ -467,11 +572,18 @@ async fn handle_dispatch(
             if !guild_allowed(app, guild_id) {
                 return Ok(());
             }
-            if let (Some(gid), Some(user_id)) = (guild_id, data.pointer("/user/id").and_then(Value::as_str)) {
+            let status = data
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("offline");
+            if let (Some(gid), Some(user_id)) =
+                (guild_id, data.pointer("/user/id").and_then(Value::as_str))
+            {
                 ctx.add_guild_member(gid, user_id);
+                ctx.update_guild_online(gid, user_id, status);
             }
             if let Some((uid, normalized)) = normalize_presence(data, None) {
-                ctx.enqueue_presence(uid, normalized);
+                ctx.enqueue_presence(app, uid, normalized);
             }
         }
         "GUILD_MEMBER_ADD" => {
@@ -539,22 +651,65 @@ async fn handle_dispatch(
     Ok(())
 }
 
-fn connect_commands_payload() -> Value {
-    json!([{
-        "name": "connect",
-        "description": "Connect your GitHub account",
-        "type": 1
-    }])
+fn commands_payload() -> Value {
+    json!([
+        {
+            "name": "connect",
+            "description": "Connect your GitHub account",
+            "type": 1
+        },
+        {
+            "name": "apikey",
+            "description": "Generate or rotate your Taggle KV API key",
+            "type": 1
+        },
+        {
+            "name": "status",
+            "description": "Show your Taggle monitoring status and API endpoints",
+            "type": 1
+        },
+        {
+            "name": "kv",
+            "description": "Manage your Discord KV key-value pairs",
+            "type": 1,
+            "options": [
+                {
+                    "name": "set",
+                    "description": "Set a KV pair",
+                    "type": 1,
+                    "options": [
+                        { "name": "key", "description": "Key ([A-Za-z0-9_])", "type": 3, "required": true },
+                        { "name": "value", "description": "Value string", "type": 3, "required": true }
+                    ]
+                },
+                {
+                    "name": "delete",
+                    "description": "Delete a KV key",
+                    "type": 1,
+                    "options": [
+                        { "name": "key", "description": "Key to delete", "type": 3, "required": true }
+                    ]
+                },
+                {
+                    "name": "list",
+                    "description": "List your current Discord KV pairs",
+                    "type": 1
+                }
+            ]
+        }
+    ])
 }
 
 fn spawn_command_registration(app: &Arc<App>, ctx: &Arc<BotContext>, app_id: String) {
-    let Some(discord) = app.config.discord.as_ref() else { return };
+    let Some(discord) = app.config.discord.as_ref() else {
+        return;
+    };
     let bot_token = discord.bot_token.clone();
     let guild_ids = discord.guild_ids.clone();
     let ctx = Arc::clone(ctx);
 
     tokio::spawn(async move {
-        // Clear any stale global commands so guild-scoped /connect never appears twice.
+        // Clear any stale global commands so guild-scoped commands never appear twice.
         if let Err(err) = put_commands(
             &ctx.http,
             &bot_token,
@@ -566,14 +721,15 @@ fn spawn_command_registration(app: &Arc<App>, ctx: &Arc<BotContext>, app_id: Str
             tracing::warn!(error = %err, "failed clearing global discord commands");
         }
 
+        let payload = commands_payload();
         for guild_id in guild_ids {
             let gid = guild_id.to_string();
             ctx.registered_guilds.lock().unwrap().insert(gid.clone());
             let url = format!("{DISCORD_API}/applications/{app_id}/guilds/{gid}/commands");
-            if let Err(err) = put_commands(&ctx.http, &bot_token, &url, &connect_commands_payload()).await {
-                tracing::warn!(error = %err, guild_id = %gid, "failed registering guild /connect command");
+            if let Err(err) = put_commands(&ctx.http, &bot_token, &url, &payload).await {
+                tracing::warn!(error = %err, guild_id = %gid, "failed registering guild slash commands");
             } else {
-                tracing::info!(guild_id = %gid, "registered /connect slash command");
+                tracing::info!(guild_id = %gid, "registered Taggle slash commands");
             }
         }
     });
@@ -586,22 +742,29 @@ fn ensure_guild_commands(app: &Arc<App>, ctx: &Arc<BotContext>, app_id: String, 
             return;
         }
     }
-    let Some(discord) = app.config.discord.as_ref() else { return };
+    let Some(discord) = app.config.discord.as_ref() else {
+        return;
+    };
     let bot_token = discord.bot_token.clone();
     let ctx = Arc::clone(ctx);
 
     tokio::spawn(async move {
         let url = format!("{DISCORD_API}/applications/{app_id}/guilds/{guild_id}/commands");
-        if let Err(err) = put_commands(&ctx.http, &bot_token, &url, &connect_commands_payload()).await {
+        if let Err(err) = put_commands(&ctx.http, &bot_token, &url, &commands_payload()).await {
             ctx.registered_guilds.lock().unwrap().remove(&guild_id);
-            tracing::warn!(error = %err, %guild_id, "failed registering guild /connect command");
+            tracing::warn!(error = %err, %guild_id, "failed registering guild slash commands");
         } else {
-            tracing::info!(%guild_id, "registered /connect slash command");
+            tracing::info!(%guild_id, "registered Taggle slash commands");
         }
     });
 }
 
-async fn put_commands(http: &reqwest::Client, bot_token: &str, url: &str, body: &Value) -> Result<()> {
+async fn put_commands(
+    http: &reqwest::Client,
+    bot_token: &str,
+    url: &str,
+    body: &Value,
+) -> Result<()> {
     let resp = http
         .put(url)
         .header("Authorization", format!("Bot {bot_token}"))
@@ -611,10 +774,24 @@ async fn put_commands(http: &reqwest::Client, bot_token: &str, url: &str, body: 
         .map_err(|err| anyhow::anyhow!("discord request failed: {}", err.without_url()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
         bail!("discord command registration failed ({status}): {text}");
     }
     Ok(())
+}
+
+fn valid_interaction_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 512
+        && !token
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
 }
 
 fn interaction_user_id(data: &Value) -> Option<&str> {
@@ -624,13 +801,44 @@ fn interaction_user_id(data: &Value) -> Option<&str> {
         .filter(|id| valid_snowflake(id))
 }
 
+fn interaction_user_meta(data: &Value) -> (Option<&str>, Option<&str>, Option<&str>) {
+    let user = data.pointer("/member/user").or_else(|| data.get("user"));
+    let username = user.and_then(|u| u.get("username")).and_then(Value::as_str);
+    let global_name = user
+        .and_then(|u| u.get("global_name"))
+        .and_then(Value::as_str);
+    let avatar = user
+        .and_then(|u| u.get("avatar"))
+        .and_then(Value::as_str)
+        .filter(|a| valid_avatar_hash(a));
+    (username, global_name, avatar)
+}
+
 async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value) -> Result<()> {
-    let Some(id) = data.get("id").and_then(Value::as_str).filter(|id| valid_snowflake(id)) else {
+    let Some(id) = data
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_snowflake(id))
+    else {
         return Ok(());
     };
-    let Some(token) = data.get("token").and_then(Value::as_str) else { return Ok(()) };
-    let Some(kind) = data.get("type").and_then(Value::as_u64) else { return Ok(()) };
-    let Some(user_id) = interaction_user_id(data).map(str::to_owned) else { return Ok(()) };
+    let Some(token) = data
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|t| valid_interaction_token(t))
+    else {
+        return Ok(());
+    };
+    let Some(kind) = data.get("type").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let Some(user_id) = interaction_user_id(data).map(str::to_owned) else {
+        return Ok(());
+    };
+
+    app.metrics
+        .discord_interactions
+        .fetch_add(1, Ordering::Relaxed);
 
     if let Some(guild_id) = data.get("guild_id").and_then(Value::as_str) {
         if !guild_allowed(app, Some(guild_id)) {
@@ -639,7 +847,10 @@ async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value)
                 id,
                 token,
                 4,
-                Some(ephemeral_data(error_message("This server is not monitored by Taggle.", false))),
+                Some(ephemeral_data(error_message(
+                    "This server is not monitored by Taggle.",
+                    false,
+                ))),
             )
             .await;
         }
@@ -651,7 +862,7 @@ async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value)
             token,
             4,
             Some(ephemeral_data(error_message(
-                "You must be a member of the monitored Discord server to use `/connect`.",
+                "You must be a member of a monitored Discord server to use Taggle commands.",
                 false,
             ))),
         )
@@ -661,15 +872,61 @@ async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value)
     match kind {
         // APPLICATION_COMMAND
         2 => {
-            if data.pointer("/data/name").and_then(Value::as_str) == Some("connect") {
-                let existing = app.store.get_discord_github_link(&user_id).await.unwrap_or(None);
-                let msg = connect_prompt_message(existing.as_deref());
-                send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg))).await?;
+            let cmd = data
+                .pointer("/data/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match cmd {
+                "connect" => {
+                    let existing = app
+                        .store
+                        .get_discord_github_link(&user_id)
+                        .await
+                        .unwrap_or(None);
+                    let msg = connect_prompt_message(existing.as_deref());
+                    send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg)))
+                        .await?;
+                }
+                "apikey" => {
+                    let existing = app
+                        .store
+                        .get_discord_github_link(&user_id)
+                        .await
+                        .unwrap_or(None);
+                    let msg = apikey_prompt_message(existing.as_deref());
+                    send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg)))
+                        .await?;
+                }
+                "status" => {
+                    let existing = app
+                        .store
+                        .get_discord_github_link(&user_id)
+                        .await
+                        .unwrap_or(None);
+                    let kv_count = app
+                        .store
+                        .list_discord_kv(&user_id)
+                        .await
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let msg = status_message(&user_id, existing.as_deref(), kv_count);
+                    send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg)))
+                        .await?;
+                }
+                "kv" => {
+                    let msg = handle_kv_command(app, &user_id, data).await;
+                    send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg)))
+                        .await?;
+                }
+                _ => {}
             }
         }
         // MESSAGE_COMPONENT (button click)
         3 => {
-            let custom_id = data.pointer("/data/custom_id").and_then(Value::as_str).unwrap_or("");
+            let custom_id = data
+                .pointer("/data/custom_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             match custom_id {
                 "connect_github" => {
                     // Ack immediately (type 6 = DEFERRED_UPDATE_MESSAGE) so Discord's 3s window never expires.
@@ -681,7 +938,11 @@ async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value)
                 }
                 "cancel_github_connect" => {
                     ctx.cancel_pending(&user_id);
-                    let existing = app.store.get_discord_github_link(&user_id).await.unwrap_or(None);
+                    let existing = app
+                        .store
+                        .get_discord_github_link(&user_id)
+                        .await
+                        .unwrap_or(None);
                     let msg = connect_prompt_message(existing.as_deref());
                     send_interaction_callback(&ctx.http, id, token, 7, Some(msg)).await?;
                 }
@@ -691,6 +952,40 @@ async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value)
                     let msg = connect_prompt_message(None);
                     send_interaction_callback(&ctx.http, id, token, 7, Some(msg)).await?;
                 }
+                "rotate_discord_key" => {
+                    if !ctx.allow_connect_click(&user_id) {
+                        return Ok(());
+                    }
+                    let (username, global_name, avatar) = interaction_user_meta(data);
+                    let key = app
+                        .store
+                        .rotate_discord_api_key(&user_id, username, global_name, avatar)
+                        .await?;
+                    let msg = issued_apikey_message(
+                        "Discord KV",
+                        &format!("/v1/discord/users/{user_id}/kv"),
+                        &key,
+                    );
+                    send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg)))
+                        .await?;
+                }
+                "rotate_github_key" => {
+                    if !ctx.allow_connect_click(&user_id) {
+                        return Ok(());
+                    }
+                    let msg = match app.store.rotate_github_api_key(&user_id).await? {
+                        Some((login, key)) => issued_apikey_message(
+                            "GitHub KV",
+                            &format!("/v1/github/users/{login}/kv"),
+                            &key,
+                        ),
+                        None => {
+                            error_message("Connect a GitHub account first with `/connect`.", false)
+                        }
+                    };
+                    send_interaction_callback(&ctx.http, id, token, 4, Some(ephemeral_data(msg)))
+                        .await?;
+                }
                 _ => {}
             }
         }
@@ -698,6 +993,93 @@ async fn handle_interaction(app: &Arc<App>, ctx: &Arc<BotContext>, data: &Value)
     }
 
     Ok(())
+}
+
+async fn handle_kv_command(app: &App, user_id: &str, data: &Value) -> Value {
+    let sub = data.pointer("/data/options/0");
+    let sub_name = sub
+        .and_then(|s| s.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let opt = |name: &str| -> Option<&str> {
+        sub.and_then(|s| s.get("options"))
+            .and_then(Value::as_array)
+            .and_then(|opts| {
+                opts.iter()
+                    .find(|o| o.get("name").and_then(Value::as_str) == Some(name))
+                    .and_then(|o| o.get("value"))
+                    .and_then(Value::as_str)
+            })
+    };
+
+    match sub_name {
+        "set" => {
+            let (Some(k), Some(v)) = (opt("key"), opt("value")) else {
+                return error_message("Provide both `key` and `value`.", false);
+            };
+            match app.store.set_discord_kv(user_id, k, v).await {
+                Ok(()) => json!({
+                    "embeds": [{
+                        "title": "KV Updated",
+                        "description": format!("Set `{k}`."),
+                        "color": COLOR_GREEN,
+                    }]
+                }),
+                Err(err) => error_message(&format!("Could not set KV: {err}"), false),
+            }
+        }
+        "delete" => {
+            let Some(k) = opt("key") else {
+                return error_message("Provide `key`.", false);
+            };
+            match app.store.delete_discord_kv(user_id, k).await {
+                Ok(true) => json!({
+                    "embeds": [{
+                        "title": "KV Deleted",
+                        "description": format!("Removed `{k}`."),
+                        "color": COLOR_GREEN,
+                    }]
+                }),
+                Ok(false) => json!({
+                    "embeds": [{
+                        "title": "KV Not Found",
+                        "description": format!("Key `{k}` was not set."),
+                        "color": COLOR_BLURPLE,
+                    }]
+                }),
+                Err(err) => error_message(&format!("Could not delete KV: {err}"), false),
+            }
+        }
+        "list" => match app.store.list_discord_kv(user_id).await {
+            Ok(pairs) if pairs.is_empty() => json!({
+                "embeds": [{
+                    "title": "Discord KV",
+                    "description": "No KV pairs stored yet. Use `/kv set` or your API key.",
+                    "color": COLOR_BLURPLE,
+                }]
+            }),
+            Ok(pairs) => {
+                let mut lines = String::new();
+                for (k, v) in pairs.iter().take(20) {
+                    let preview: String = v.chars().take(60).collect();
+                    let suffix = if v.chars().count() > 60 { "…" } else { "" };
+                    lines.push_str(&format!("`{k}` = `{preview}{suffix}`\n"));
+                }
+                if pairs.len() > 20 {
+                    lines.push_str(&format!("\n…and {} more", pairs.len() - 20));
+                }
+                json!({
+                    "embeds": [{
+                        "title": format!("Discord KV ({} keys)", pairs.len()),
+                        "description": lines,
+                        "color": COLOR_BLURPLE,
+                    }]
+                })
+            }
+            Err(err) => error_message(&format!("Could not load KV: {err}"), false),
+        },
+        _ => error_message("Unknown `/kv` subcommand.", false),
+    }
 }
 
 #[derive(Deserialize)]
@@ -733,7 +1115,10 @@ async fn start_github_device_flow(
         .context("missing discord application_id")?;
 
     let Some(client_id) = app.config.github_client_id.clone() else {
-        let msg = error_message("GitHub OAuth is not configured (`GITHUB_APP_CLIENT_ID` is missing).", false);
+        let msg = error_message(
+            "GitHub OAuth is not configured (`GITHUB_APP_CLIENT_ID` is missing).",
+            false,
+        );
         return edit_original_interaction(&ctx.http, &app_id, interaction_token, &msg).await;
     };
 
@@ -746,19 +1131,21 @@ async fn start_github_device_flow(
         .await?;
 
     let body_text = resp.text().await.unwrap_or_default();
-    let parsed: DeviceCodeResponse = serde_json::from_str(&body_text).unwrap_or(DeviceCodeResponse {
-        device_code: None,
-        user_code: None,
-        verification_uri: None,
-        expires_in: None,
-        interval: None,
-        error: Some("invalid_response".into()),
-        error_description: Some(body_text.chars().take(300).collect()),
-    });
+    let parsed: DeviceCodeResponse =
+        serde_json::from_str(&body_text).unwrap_or(DeviceCodeResponse {
+            device_code: None,
+            user_code: None,
+            verification_uri: None,
+            expires_in: None,
+            interval: None,
+            error: Some("invalid_response".into()),
+            error_description: Some(body_text.chars().take(300).collect()),
+        });
 
     if let Some(err) = parsed.error {
         let detail = if err == "device_flow_disabled" {
-            "Enable **Device Flow** in your GitHub App settings to connect through Discord.".to_owned()
+            "Enable **Device Flow** in your GitHub App settings to connect through Discord."
+                .to_owned()
         } else {
             parsed.error_description.unwrap_or(err)
         };
@@ -803,7 +1190,10 @@ async fn start_github_device_flow(
 
         if let Err(err) = outcome {
             tracing::warn!(error = %err, discord_user_id = %user_id_bg, "github device flow failed");
-            let msg = error_message("Could not complete GitHub authorization. Please try again.", true);
+            let msg = error_message(
+                "Could not complete GitHub authorization. Please try again.",
+                true,
+            );
             let _ = edit_original_interaction(&ctx_bg.http, &app_id, &token_bg, &msg).await;
         }
         ctx_bg.clear_pending_if_match(&user_id_bg, task_id);
@@ -831,7 +1221,10 @@ async fn poll_github_device_token(
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
         if Instant::now() >= deadline {
-            let msg = error_message("GitHub authorization code expired. Click below to try again.", true);
+            let msg = error_message(
+                "GitHub authorization code expired. Click below to try again.",
+                true,
+            );
             edit_original_interaction(&ctx.http, app_id, interaction_token, &msg).await?;
             return Ok(());
         }
@@ -891,7 +1284,10 @@ async fn poll_github_device_token(
                 interval = body.interval.unwrap_or(interval + 5).max(interval + 5);
             }
             Some("expired_token") => {
-                let msg = error_message("GitHub authorization code expired. Click below to try again.", true);
+                let msg = error_message(
+                    "GitHub authorization code expired. Click below to try again.",
+                    true,
+                );
                 edit_original_interaction(&ctx.http, app_id, interaction_token, &msg).await?;
                 return Ok(());
             }
@@ -932,13 +1328,22 @@ async fn complete_github_connection(
     }
 
     let gh_user: Value = resp.json().await?;
-    let gh_id = gh_user.get("id").and_then(Value::as_i64).context("missing github user id")?;
-    let gh_login = gh_user.get("login").and_then(Value::as_str).context("missing github login")?;
+    let gh_id = gh_user
+        .get("id")
+        .and_then(Value::as_i64)
+        .context("missing github user id")?;
+    let gh_login = gh_user
+        .get("login")
+        .and_then(Value::as_str)
+        .context("missing github login")?;
     let gh_name = gh_user.get("name").and_then(Value::as_str);
     let gh_avatar = gh_user.get("avatar_url").and_then(Value::as_str);
 
     if !is_user_in_monitored_guild(app, ctx, discord_user_id).await {
-        let msg = error_message("You must remain in the monitored Discord server to connect GitHub.", false);
+        let msg = error_message(
+            "You must remain in the monitored Discord server to connect GitHub.",
+            false,
+        );
         edit_original_interaction(&ctx.http, app_id, interaction_token, &msg).await?;
         return Ok(());
     }
@@ -951,10 +1356,10 @@ async fn complete_github_connection(
         .link_discord_github(discord_user_id, gh_id, &login_lower)
         .await?;
 
-    if app.github.is_some() {
-        if let Err(err) = crate::sync::sync_user(app, &login_lower, Some(access_token)).await {
-            tracing::warn!(error = %err, login = %login_lower, "initial github sync after /connect failed");
-        }
+    if app.github.is_some()
+        && let Err(err) = crate::sync::sync_user(app, &login_lower, Some(access_token)).await
+    {
+        tracing::warn!(error = %err, login = %login_lower, "initial github sync after /connect failed");
     }
 
     let msg = connected_message(&login_lower, gh_avatar);
@@ -963,7 +1368,12 @@ async fn complete_github_connection(
     Ok(())
 }
 
-async fn reconcile_guild_members(app: &Arc<App>, ctx: &Arc<BotContext>, _guild_id: &str, complete_snapshot: bool) {
+async fn reconcile_guild_members(
+    app: &Arc<App>,
+    ctx: &Arc<BotContext>,
+    _guild_id: &str,
+    complete_snapshot: bool,
+) {
     let tracked = match app.store.list_tracked_discord_user_ids().await {
         Ok(ids) => ids,
         Err(err) => {
@@ -1022,7 +1432,12 @@ async fn is_user_in_monitored_guild(app: &App, ctx: &BotContext, user_id: &str) 
         {
             guild_ids = guilds
                 .into_iter()
-                .filter_map(|g| g.get("id").and_then(Value::as_str).filter(|id| valid_snowflake(id)).map(str::to_owned))
+                .filter_map(|g| {
+                    g.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| valid_snowflake(id))
+                        .map(str::to_owned)
+                })
                 .collect();
         }
         if guild_ids.is_empty() {
@@ -1078,7 +1493,13 @@ async fn send_interaction_callback(
         .map_err(|err| anyhow::anyhow!("discord request failed: {}", err.without_url()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
         bail!("discord interaction callback failed ({status}): {text}");
     }
     Ok(())
@@ -1099,7 +1520,13 @@ async fn edit_original_interaction(
         .map_err(|err| anyhow::anyhow!("discord request failed: {}", err.without_url()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
         bail!("discord interaction edit failed ({status}): {text}");
     }
     Ok(())
@@ -1246,7 +1673,7 @@ fn error_message(message: &str, retry: bool) -> Value {
 
     json!({
         "embeds": [{
-            "title": "GitHub Connection Failed",
+            "title": "Taggle Error",
             "description": message,
             "color": COLOR_RED,
         }],
@@ -1254,8 +1681,77 @@ fn error_message(message: &str, retry: bool) -> Value {
     })
 }
 
+fn apikey_prompt_message(existing_github: Option<&str>) -> Value {
+    let mut buttons = vec![json!({
+        "type": 2,
+        "style": 1,
+        "custom_id": "rotate_discord_key",
+        "label": "Discord KV Key",
+    })];
+    if existing_github.is_some() {
+        buttons.push(json!({
+            "type": 2,
+            "style": 2,
+            "custom_id": "rotate_github_key",
+            "label": "GitHub KV Key",
+        }));
+    }
+
+    let desc = match existing_github {
+        Some(login) => format!(
+            "Generate a bearer API key (`tggl_...`) for updating your KV store.\n\n• **Discord KV** is ready.\n• **GitHub KV** is linked to **@{login}**.\n\nGenerating a new key immediately replaces the previous one."
+        ),
+        None => "Generate a bearer API key (`tggl_...`) for updating your Discord KV store.\n\nConnect GitHub via `/connect` to also issue a GitHub KV key.\n\nGenerating a new key immediately replaces the previous one.".to_owned(),
+    };
+
+    json!({
+        "embeds": [{
+            "title": "API Keys",
+            "description": desc,
+            "color": COLOR_BLURPLE,
+        }],
+        "components": [{
+            "type": 1,
+            "components": buttons,
+        }]
+    })
+}
+
+fn issued_apikey_message(scope: &str, endpoint_path: &str, raw_key: &str) -> Value {
+    json!({
+        "embeds": [{
+            "title": format!("{scope} API Key Issued"),
+            "description": format!(
+                "Copy this key now — **it will not be shown again** (only its SHA-256 hash is stored).\n\n```\n{raw_key}\n```\n**Example:**\n```http\nPUT {endpoint_path}/currently_building\nAuthorization: Bearer {raw_key}\n{{\"value\": \"taggle\"}}\n```"
+            ),
+            "color": COLOR_GREEN,
+        }]
+    })
+}
+
+fn status_message(user_id: &str, github_login: Option<&str>, kv_count: usize) -> Value {
+    let gh_line = match github_login {
+        Some(login) => format!("**Connected:** `@{login}` (`/v1/github/users/{login}`)"),
+        None => "Not connected (run `/connect` to link GitHub)".to_owned(),
+    };
+
+    json!({
+        "embeds": [{
+            "title": "Taggle Status",
+            "color": COLOR_BLURPLE,
+            "fields": [
+                { "name": "Discord Presence", "value": format!("Monitored (`/v1/discord/users/{user_id}`)\nKV pairs: `{kv_count}`"), "inline": false },
+                { "name": "GitHub Activity", "value": gh_line, "inline": false },
+                { "name": "Unified Profile & SVG", "value": format!("Profile JSON: `/v1/profiles/{user_id}`\nREADME Card: `/v1/profiles/{user_id}/card.svg`\nBadge: `/v1/users/{user_id}/badge.svg`"), "inline": false },
+            ]
+        }]
+    })
+}
+
 fn guild_allowed(app: &App, guild_id: Option<&str>) -> bool {
-    let Some(discord) = app.config.discord.as_ref() else { return false };
+    let Some(discord) = app.config.discord.as_ref() else {
+        return false;
+    };
     if discord.guild_ids.is_empty() {
         return true;
     }
@@ -1264,7 +1760,85 @@ fn guild_allowed(app: &App, guild_id: Option<&str>) -> bool {
         .is_some_and(|id| discord.guild_ids.contains(&id))
 }
 
-/// Converts a raw Discord presence into Lanyard's response shape.
+fn valid_avatar_hash(avatar: &str) -> bool {
+    !avatar.is_empty()
+        && avatar.len() <= 64
+        && avatar
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn sanitize_activity(raw: &Value) -> Option<Value> {
+    let obj = raw.as_object()?;
+    let mut clean = serde_json::Map::new();
+    const ALLOWED_KEYS: &[&str] = &[
+        "id",
+        "name",
+        "type",
+        "details",
+        "state",
+        "timestamps",
+        "assets",
+        "sync_id",
+        "application_id",
+        "flags",
+        "created_at",
+        "emoji",
+        "party",
+        "url",
+    ];
+    for key in ALLOWED_KEYS {
+        if let Some(val) = obj.get(*key) {
+            let v = match val {
+                Value::String(s) => Value::String(crate::normalize::truncate_chars(s, 512)),
+                other => other.clone(),
+            };
+            clean.insert((*key).to_owned(), v);
+        }
+    }
+    Some(Value::Object(clean))
+}
+
+fn is_coding_editor(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "visual studio code"
+            | "code"
+            | "cursor"
+            | "zed"
+            | "neovim"
+            | "nvim"
+            | "intellij idea"
+            | "webstorm"
+            | "pycharm"
+            | "rustrover"
+            | "clion"
+            | "goland"
+            | "phpstorm"
+            | "rubymine"
+            | "datagrip"
+            | "android studio"
+            | "xcode"
+            | "sublime text"
+            | "emacs"
+            | "helix"
+    )
+}
+
+fn build_coding(activity: &Value) -> Value {
+    let timestamps = activity.get("timestamps").and_then(Value::as_object);
+    json!({
+        "editor": activity.get("name").cloned().unwrap_or(Value::Null),
+        "details": activity.get("details").cloned().unwrap_or(Value::Null),
+        "state": activity.get("state").cloned().unwrap_or(Value::Null),
+        "timestamps": {
+            "start": timestamps.and_then(|t| t.get("start")).cloned().unwrap_or(Value::Null),
+            "end": timestamps.and_then(|t| t.get("end")).cloned().unwrap_or(Value::Null),
+        },
+    })
+}
+
+/// Converts a raw Discord presence into Taggle's Lanyard-compatible response shape.
 pub fn normalize_presence(data: &Value, member: Option<&Value>) -> Option<(String, Value)> {
     // GUILD_CREATE presences may carry only a partial user object, so fall back
     // to the guild member payload for the missing profile fields.
@@ -1282,6 +1856,11 @@ pub fn normalize_presence(data: &Value, member: Option<&Value>) -> Option<(Strin
             .unwrap_or(Value::Null)
     };
 
+    let avatar = match field("avatar") {
+        Value::String(s) if valid_avatar_hash(&s) => Value::String(s),
+        _ => Value::Null,
+    };
+
     let client_status = data.get("client_status").and_then(Value::as_object);
     let active = |platform: &str| {
         client_status
@@ -1296,17 +1875,23 @@ pub fn normalize_presence(data: &Value, member: Option<&Value>) -> Option<(Strin
         .into_iter()
         .flatten()
         .take(20)
-        .cloned()
+        .filter_map(sanitize_activity)
         .collect();
     let spotify_activity = activities
         .iter()
         .find(|activity| activity.get("name").and_then(Value::as_str) == Some("Spotify"));
+    let coding_activity = activities.iter().find(|activity| {
+        activity
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(is_coding_editor)
+    });
 
     let discord_user = json!({
         "id": user_id,
         "username": field("username"),
         "discriminator": non_null(field("discriminator"), json!("0")),
-        "avatar": field("avatar"),
+        "avatar": avatar,
         "global_name": field("global_name"),
         "public_flags": non_null(field("public_flags"), json!(0)),
         "bot": non_null(field("bot"), json!(false)),
@@ -1321,6 +1906,7 @@ pub fn normalize_presence(data: &Value, member: Option<&Value>) -> Option<(Strin
         "active_on_discord_web": active("web"),
         "listening_to_spotify": spotify_activity.is_some(),
         "spotify": spotify_activity.map(build_spotify),
+        "coding": coding_activity.map(build_coding),
         "kv": {},
     });
 
@@ -1338,7 +1924,11 @@ fn build_spotify(activity: &Value) -> Value {
         .pointer("/assets/large_image")
         .and_then(Value::as_str)
         .map(|image| image.strip_prefix("spotify:").unwrap_or(image))
-        .filter(|image| !image.is_empty() && image.len() <= 128 && image.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .filter(|image| {
+            !image.is_empty()
+                && image.len() <= 128
+                && image.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
         .map(|image| format!("https://i.scdn.co/image/{image}"))
         .unwrap_or_default();
 
@@ -1369,9 +1959,13 @@ mod tests {
         assert!(!valid_snowflake("../etc/passwd"));
         assert!(!valid_snowflake("123456789012345678901"));
         assert!(is_discord_gateway_url("wss://gateway.discord.gg"));
-        assert!(is_discord_gateway_url("wss://gateway-us-east1-b.discord.gg/"));
+        assert!(is_discord_gateway_url(
+            "wss://gateway-us-east1-b.discord.gg/"
+        ));
         assert!(!is_discord_gateway_url("ws://gateway.discord.gg"));
-        assert!(!is_discord_gateway_url("wss://evil.example/gateway.discord.gg"));
+        assert!(!is_discord_gateway_url(
+            "wss://evil.example/gateway.discord.gg"
+        ));
         assert!(!is_discord_gateway_url("wss://user@gateway.discord.gg"));
     }
 
@@ -1439,7 +2033,8 @@ mod tests {
     #[test]
     fn fills_partial_presence_user_from_member() {
         // GUILD_CREATE presences can arrive with just the user id.
-        let presence = json!({ "user": { "id": "123456789" }, "status": "online", "activities": [] });
+        let presence =
+            json!({ "user": { "id": "123456789" }, "status": "online", "activities": [] });
         let member = json!({
             "user": {
                 "id": "123456789",
@@ -1472,19 +2067,96 @@ mod tests {
     fn builds_connect_and_green_connected_messages() {
         let prompt = connect_prompt_message(None);
         assert_eq!(prompt["components"][0]["components"][0]["label"], "GitHub");
-        assert_eq!(prompt["components"][0]["components"][0]["custom_id"], "connect_github");
+        assert_eq!(
+            prompt["components"][0]["components"][0]["custom_id"],
+            "connect_github"
+        );
 
         let device = device_flow_message("ABCD-1234", "https://github.com/login/device");
-        assert!(device["embeds"][0]["description"].as_str().unwrap().contains("ABCD-1234"));
+        assert!(
+            device["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("ABCD-1234")
+        );
         assert_eq!(device["components"][0]["components"][0]["style"], 5);
-        assert_eq!(device["components"][0]["components"][0]["url"], "https://github.com/login/device");
+        assert_eq!(
+            device["components"][0]["components"][0]["url"],
+            "https://github.com/login/device"
+        );
 
-        let connected = connected_message("octocat", Some("https://avatars.githubusercontent.com/u/1"));
+        let connected =
+            connected_message("octocat", Some("https://avatars.githubusercontent.com/u/1"));
         assert_eq!(connected["embeds"][0]["title"], "Connected");
         assert_eq!(connected["embeds"][0]["color"], COLOR_GREEN);
-        assert!(connected["embeds"][0]["description"].as_str().unwrap().contains("@octocat"));
+        assert!(
+            connected["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("@octocat")
+        );
         assert_eq!(connected["components"][0]["components"][0]["style"], 3);
-        assert_eq!(connected["components"][0]["components"][0]["label"], "Connected");
-        assert_eq!(connected["components"][0]["components"][0]["disabled"], true);
+        assert_eq!(
+            connected["components"][0]["components"][0]["label"],
+            "Connected"
+        );
+        assert_eq!(
+            connected["components"][0]["components"][0]["disabled"],
+            true
+        );
+    }
+
+    #[test]
+    fn sanitizes_activities_extracts_coding_and_validates_tokens() {
+        assert!(valid_interaction_token("abc123_def-ghi"));
+        assert!(!valid_interaction_token(""));
+        assert!(!valid_interaction_token("bad/token"));
+        assert!(!valid_interaction_token("bad?token=1"));
+        assert!(valid_avatar_hash("a_0123456789abcdef"));
+        assert!(!valid_avatar_hash("../evil"));
+
+        let raw = json!({
+            "user": { "id": "123456789012345678", "username": "dev", "avatar": "../../evil" },
+            "status": "online",
+            "activities": [{
+                "name": "Neovim",
+                "type": 0,
+                "details": "Editing router.ex",
+                "state": "Workspace: taggle",
+                "session_id": "secret-session-id-should-strip"
+            }]
+        });
+
+        let (_, normalized) = normalize_presence(&raw, None).unwrap();
+        assert!(normalized["discord_user"]["avatar"].is_null());
+        assert!(normalized["activities"][0].get("session_id").is_none());
+        assert_eq!(normalized["coding"]["editor"], "Neovim");
+        assert_eq!(normalized["coding"]["details"], "Editing router.ex");
+        assert_eq!(normalized["coding"]["state"], "Workspace: taggle");
+
+        let cmds = commands_payload();
+        let names: Vec<&str> = cmds
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["connect", "apikey", "status", "kv"]);
+
+        let apikey_msg = apikey_prompt_message(Some("octocat"));
+        assert_eq!(
+            apikey_msg["components"][0]["components"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let status_msg = status_message("123456789012345678", Some("octocat"), 3);
+        assert!(
+            status_msg["embeds"][0]["fields"][1]["value"]
+                .as_str()
+                .unwrap()
+                .contains("@octocat")
+        );
     }
 }

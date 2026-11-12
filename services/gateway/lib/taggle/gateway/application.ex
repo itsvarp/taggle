@@ -4,13 +4,20 @@ defmodule Taggle.Gateway.Application do
 
   @impl true
   def start(_type, _args) do
+    Taggle.Gateway.Metrics.init()
+    Taggle.Gateway.RateLimit.init()
+
     redis_url = System.get_env("REDIS_URL", "redis://localhost:6380")
-    database_url = System.get_env("DATABASE_URL", "postgres://taggle:taggle@localhost:5433/taggle")
+
+    database_url =
+      System.get_env("DATABASE_URL", "postgres://taggle:taggle@localhost:5433/taggle")
+
     port = String.to_integer(System.get_env("PORT", "4000"))
 
     children = [
       # One entry per WebSocket per subscribed login; used for fan-out.
-      {Registry, keys: :duplicate, name: Taggle.Gateway.Subs, partitions: System.schedulers_online()},
+      {Registry,
+       keys: :duplicate, name: Taggle.Gateway.Subs, partitions: System.schedulers_online()},
       {Postgrex, [name: :pg, pool_size: 10] ++ parse_pg_url(database_url)},
       {Redix, {redis_url, [name: :redix]}},
       {Taggle.Gateway.GitHubFanout, redis_url: redis_url},

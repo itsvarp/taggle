@@ -1,14 +1,24 @@
 defmodule Taggle.Gateway.GitHubAuth do
   @moduledoc """
-  API key extraction for GitHub KV HTTP endpoints.
+  API key extraction and format validation for KV HTTP endpoints.
   """
 
   def extract_api_key(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] -> String.trim(token)
-      ["bearer " <> token] -> String.trim(token)
-      [token] -> String.trim(token)
-      _ -> nil
-    end
+    token =
+      case Plug.Conn.get_req_header(conn, "authorization") do
+        ["Bearer " <> t] -> String.trim(t)
+        ["bearer " <> t] -> String.trim(t)
+        [t] -> String.trim(t)
+        _ -> nil
+      end
+
+    if valid_token_shape?(token), do: token, else: nil
   end
+
+  def valid_token_shape?(token) when is_binary(token) do
+    String.starts_with?(token, "tggl_") and byte_size(token) >= 16 and byte_size(token) <= 128 and
+      not String.contains?(token, [" ", "\t", "\r", "\n"])
+  end
+
+  def valid_token_shape?(_), do: false
 end

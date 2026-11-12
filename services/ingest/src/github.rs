@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    sync::Mutex,
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +14,11 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::normalize::{Act, person};
+use crate::{
+    metrics::IngestMetrics,
+    normalize::{Act, person, short_sha, truncate_chars, valid_repo_slug},
+    store::Store,
+};
 
 const API: &str = "https://api.github.com";
 
@@ -22,6 +26,8 @@ pub struct GitHub {
     http: reqwest::Client,
     app_id: String,
     key: EncodingKey,
+    store: Option<Store>,
+    metrics: Option<Arc<IngestMetrics>>,
     tokens: Mutex<HashMap<i64, (String, Instant)>>,
     etags: Mutex<HashMap<String, String>>,
     unauth_core_reset_at: Mutex<Option<Instant>>,
@@ -64,7 +70,10 @@ impl GitHub {
                 .timeout(Duration::from_secs(15))
                 .build()?,
             app_id: app_id.to_owned(),
-            key: EncodingKey::from_rsa_pem(pem.as_bytes()).context("invalid GITHUB_APP_PRIVATE_KEY")?,
+            key: EncodingKey::from_rsa_pem(pem.as_bytes())
+                .context("invalid GITHUB_APP_PRIVATE_KEY")?,
+            store: None,
+            metrics: None,
             tokens: Mutex::new(HashMap::new()),
             etags: Mutex::new(HashMap::new()),
             unauth_core_reset_at: Mutex::new(None),
@@ -77,21 +86,63 @@ impl GitHub {
         })
     }
 
+    pub fn with_infra(mut self, store: Store, metrics: Arc<IngestMetrics>) -> Self {
+        self.store = Some(store);
+        self.metrics = Some(metrics);
+        self
+    }
+
+    async fn cached_etag(&self, url: &str) -> Option<String> {
+        if let Some(etag) = self.etags.lock().unwrap().get(url).cloned() {
+            return Some(etag);
+        }
+        if let Some(store) = &self.store
+            && let Some(etag) = store.get_etag(url).await
+        {
+            let mut map = self.etags.lock().unwrap();
+            if map.len() >= 2000 {
+                map.clear();
+            }
+            map.insert(url.to_owned(), etag.clone());
+            return Some(etag);
+        }
+        None
+    }
+
+    async fn store_etag(&self, url: &str, etag: &str) {
+        {
+            let mut map = self.etags.lock().unwrap();
+            if map.len() >= 2000 {
+                map.clear();
+            }
+            map.insert(url.to_owned(), etag.to_owned());
+        }
+        if let Some(store) = &self.store {
+            store.set_etag(url, etag).await;
+        }
+    }
+
     fn app_jwt(&self) -> Result<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let claims = Claims { iat: now - 60, exp: now + 9 * 60, iss: &self.app_id };
+        let claims = Claims {
+            iat: now - 60,
+            exp: now + 9 * 60,
+            iss: &self.app_id,
+        };
         Ok(encode(&Header::new(Algorithm::RS256), &claims, &self.key)?)
     }
 
     async fn installation_token(&self, installation: i64) -> Result<String> {
-        if let Some((tok, exp)) = self.tokens.lock().unwrap().get(&installation) {
-            if *exp > Instant::now() {
-                return Ok(tok.clone());
-            }
+        if let Some((tok, exp)) = self.tokens.lock().unwrap().get(&installation)
+            && *exp > Instant::now()
+        {
+            return Ok(tok.clone());
         }
         let resp = self
             .http
-            .post(format!("{API}/app/installations/{installation}/access_tokens"))
+            .post(format!(
+                "{API}/app/installations/{installation}/access_tokens"
+            ))
             .bearer_auth(self.app_jwt()?)
             .header("Accept", "application/vnd.github+json")
             .send()
@@ -100,16 +151,24 @@ impl GitHub {
             bail!("installation token request failed: {}", resp.status());
         }
         let body: Value = resp.json().await?;
-        let token = body["token"].as_str().context("no token in response")?.to_owned();
+        let token = body["token"]
+            .as_str()
+            .context("no token in response")?
+            .to_owned();
         // Tokens live 1h; refresh after 50 minutes.
-        self.tokens
-            .lock()
-            .unwrap()
-            .insert(installation, (token.clone(), Instant::now() + Duration::from_secs(50 * 60)));
+        self.tokens.lock().unwrap().insert(
+            installation,
+            (token.clone(), Instant::now() + Duration::from_secs(50 * 60)),
+        );
         Ok(token)
     }
 
-    async fn get_json(&self, url: &str, bearer: Option<&str>, use_etag: bool) -> Result<Option<Value>> {
+    async fn get_json(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        use_etag: bool,
+    ) -> Result<Option<Value>> {
         let is_search = url.contains("/search/");
         if bearer.is_none() {
             let cooldown = if is_search {
@@ -117,10 +176,10 @@ impl GitHub {
             } else {
                 &self.unauth_core_reset_at
             };
-            if let Some(until) = *cooldown.lock().unwrap() {
-                if Instant::now() < until {
-                    bail!("github public rate limit cooling down");
-                }
+            if let Some(until) = *cooldown.lock().unwrap()
+                && Instant::now() < until
+            {
+                bail!("github public rate limit cooling down");
             }
         }
 
@@ -131,12 +190,16 @@ impl GitHub {
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
-        if use_etag && bearer.is_none() {
-            if let Some(etag) = self.etags.lock().unwrap().get(url).cloned() {
-                req = req.header("If-None-Match", etag);
-            }
+        if use_etag
+            && bearer.is_none()
+            && let Some(etag) = self.cached_etag(url).await
+        {
+            req = req.header("If-None-Match", etag);
         }
 
+        if let Some(m) = &self.metrics {
+            m.github_api_requests.fetch_add(1, Ordering::Relaxed);
+        }
         let resp = req
             .send()
             .await
@@ -144,6 +207,9 @@ impl GitHub {
         let status = resp.status();
 
         if status == StatusCode::NOT_MODIFIED {
+            if let Some(m) = &self.metrics {
+                m.github_api_not_modified.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(None);
         }
         if status == StatusCode::CONFLICT {
@@ -151,20 +217,39 @@ impl GitHub {
             return Ok(Some(json!([])));
         }
 
-        if matches!(status, StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS) {
+        if matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            if let Some(m) = &self.metrics {
+                m.github_api_rate_limited.fetch_add(1, Ordering::Relaxed);
+            }
             let remaining = resp
                 .headers()
                 .get("x-ratelimit-remaining")
                 .and_then(|v| v.to_str().ok());
-            if bearer.is_none() && (remaining == Some("0") || status == StatusCode::TOO_MANY_REQUESTS) {
-                let wait_secs = resp
-                    .headers()
-                    .get("x-ratelimit-reset")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .and_then(|reset| {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-                        Some(reset.saturating_sub(now).clamp(30, 900))
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            if bearer.is_none()
+                && (remaining == Some("0")
+                    || status == StatusCode::TOO_MANY_REQUESTS
+                    || retry_after.is_some())
+            {
+                let wait_secs = retry_after
+                    .map(|s| s.clamp(30, 900))
+                    .or_else(|| {
+                        resp.headers()
+                            .get("x-ratelimit-reset")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .and_then(|reset| {
+                                let now =
+                                    SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                                Some(reset.saturating_sub(now).clamp(30, 900))
+                            })
                     })
                     .unwrap_or(120);
                 let target = if is_search {
@@ -183,13 +268,13 @@ impl GitHub {
 
         if use_etag
             && bearer.is_none()
-            && let Some(etag) = resp.headers().get("etag").and_then(|v| v.to_str().ok())
+            && let Some(etag) = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
         {
-            let mut map = self.etags.lock().unwrap();
-            if map.len() >= 2000 {
-                map.clear();
-            }
-            map.insert(url.to_owned(), etag.to_owned());
+            self.store_etag(url, &etag).await;
         }
 
         Ok(Some(resp.json().await?))
@@ -197,12 +282,13 @@ impl GitHub {
 
     async fn get_text(&self, url: &str, use_etag: bool) -> Result<Option<String>> {
         let mut req = self.http.get(url);
-        if use_etag {
-            if let Some(etag) = self.etags.lock().unwrap().get(url).cloned() {
-                req = req.header("If-None-Match", etag);
-            }
+        if use_etag && let Some(etag) = self.cached_etag(url).await {
+            req = req.header("If-None-Match", etag);
         }
 
+        if let Some(m) = &self.metrics {
+            m.github_api_requests.fetch_add(1, Ordering::Relaxed);
+        }
         let resp = req
             .send()
             .await
@@ -210,6 +296,9 @@ impl GitHub {
         let status = resp.status();
 
         if status == StatusCode::NOT_MODIFIED {
+            if let Some(m) = &self.metrics {
+                m.github_api_not_modified.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(None);
         }
         if !status.is_success() {
@@ -217,13 +306,13 @@ impl GitHub {
         }
 
         if use_etag
-            && let Some(etag) = resp.headers().get("etag").and_then(|v| v.to_str().ok())
+            && let Some(etag) = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
         {
-            let mut map = self.etags.lock().unwrap();
-            if map.len() >= 2000 {
-                map.clear();
-            }
-            map.insert(url.to_owned(), etag.to_owned());
+            self.store_etag(url, &etag).await;
         }
 
         Ok(Some(resp.text().await?))
@@ -250,13 +339,20 @@ impl GitHub {
             .get_json(&format!("{API}/app"), Some(&jwt), false)
             .await?
             .context("empty /app response")?;
-        body["slug"].as_str().map(str::to_owned).context("missing slug in /app response")
+        body["slug"]
+            .as_str()
+            .map(str::to_owned)
+            .context("missing slug in /app response")
     }
 
     pub async fn list_app_installations(&self) -> Result<Vec<AppInstallation>> {
         let jwt = self.app_jwt()?;
         let Some(body) = self
-            .get_json(&format!("{API}/app/installations?per_page=100"), Some(&jwt), false)
+            .get_json(
+                &format!("{API}/app/installations?per_page=100"),
+                Some(&jwt),
+                false,
+            )
             .await?
         else {
             return Ok(vec![]);
@@ -273,12 +369,23 @@ impl GitHub {
                     .pointer("/account/avatar_url")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                Some(AppInstallation { id, login, account_id, avatar_url })
+                Some(AppInstallation {
+                    id,
+                    login,
+                    account_id,
+                    avatar_url,
+                })
             })
             .collect())
     }
 
-    pub async fn enrich_pr(&self, installation: i64, owner: &str, repo: &str, number: i64) -> Result<Enrichment> {
+    pub async fn enrich_pr(
+        &self,
+        installation: i64,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Enrichment> {
         const QUERY: &str = r#"
         query($owner:String!,$name:String!,$number:Int!){
           repository(owner:$owner,name:$name){
@@ -292,11 +399,20 @@ impl GitHub {
         }"#;
 
         let body = self
-            .graphql(installation, QUERY, json!({ "owner": owner, "name": repo, "number": number }))
+            .graphql(
+                installation,
+                QUERY,
+                json!({ "owner": owner, "name": repo, "number": number }),
+            )
             .await?;
-        let pr = body.pointer("/data/repository/pullRequest").filter(|v| !v.is_null());
+        let pr = body
+            .pointer("/data/repository/pullRequest")
+            .filter(|v| !v.is_null());
         let Some(pr) = pr else {
-            bail!("pull request not found in graphql response: {}", body["errors"])
+            bail!(
+                "pull request not found in graphql response: {}",
+                body["errors"]
+            )
         };
         Ok(parse_enrichment(pr))
     }
@@ -305,7 +421,11 @@ impl GitHub {
     pub async fn backfill_installation(&self, installation: i64) -> Result<Vec<Act>> {
         let token = self.installation_token(installation).await?;
         let Some(body) = self
-            .get_json(&format!("{API}/installation/repositories?per_page=100"), Some(&token), false)
+            .get_json(
+                &format!("{API}/installation/repositories?per_page=100"),
+                Some(&token),
+                false,
+            )
             .await?
         else {
             return Ok(vec![]);
@@ -324,18 +444,28 @@ impl GitHub {
 
         let mut acts = Vec::new();
         for r in repos.into_iter().take(6) {
-            let Some(full) = r.get("full_name").and_then(Value::as_str) else { continue };
+            let Some(full) = r.get("full_name").and_then(Value::as_str) else {
+                continue;
+            };
             if !valid_repo_slug(full) {
                 continue;
             }
             let pushed_at = r.get("pushed_at").and_then(Value::as_str).unwrap_or("");
             let cache_key = format!("{installation}:{full}");
             if !pushed_at.is_empty()
-                && self.inst_pushed_at.lock().unwrap().get(&cache_key).map(String::as_str) == Some(pushed_at)
+                && self
+                    .inst_pushed_at
+                    .lock()
+                    .unwrap()
+                    .get(&cache_key)
+                    .map(String::as_str)
+                    == Some(pushed_at)
             {
                 continue;
             }
-            let Some((owner, name)) = full.split_once('/') else { continue };
+            let Some((owner, name)) = full.split_once('/') else {
+                continue;
+            };
             match self.backfill_repo(installation, owner, name).await {
                 Ok(mut repo_acts) => {
                     if !pushed_at.is_empty() {
@@ -380,12 +510,13 @@ impl GitHub {
             .take(5)
             .collect();
 
-        let mut fetches = stream::iter(candidates.into_iter().map(|(full, updated_at)| async move {
-            let atom_url = format!("https://github.com/{full}/commits.atom");
-            let res = self.get_text(&atom_url, use_etag).await;
-            (full, updated_at, res)
-        }))
-        .buffer_unordered(4);
+        let mut fetches =
+            stream::iter(candidates.into_iter().map(|(full, updated_at)| async move {
+                let atom_url = format!("https://github.com/{full}/commits.atom");
+                let res = self.get_text(&atom_url, use_etag).await;
+                (full, updated_at, res)
+            }))
+            .buffer_unordered(4);
 
         let mut acts = Vec::new();
         let mut seen_keys = HashSet::new();
@@ -408,10 +539,15 @@ impl GitHub {
                 }
                 Ok(None) => {
                     if !updated_at.is_empty() {
-                        self.web_repo_updated_at.lock().unwrap().insert(full, updated_at);
+                        self.web_repo_updated_at
+                            .lock()
+                            .unwrap()
+                            .insert(full, updated_at);
                     }
                 }
-                Err(err) => tracing::debug!(error = %err, repo = %full, "atom commits fetch skipped"),
+                Err(err) => {
+                    tracing::debug!(error = %err, repo = %full, "atom commits fetch skipped")
+                }
             }
         }
 
@@ -419,7 +555,12 @@ impl GitHub {
     }
 
     /// Fetches public commits, pull requests and issues for a monitored user without webhooks.
-    pub async fn backfill_user_public(&self, login: &str, oauth_token: Option<&str>, use_etag: bool) -> Result<Vec<Act>> {
+    pub async fn backfill_user_public(
+        &self,
+        login: &str,
+        oauth_token: Option<&str>,
+        use_etag: bool,
+    ) -> Result<Vec<Act>> {
         if !crate::store::valid_github_login(login) {
             bail!("invalid GitHub login");
         }
@@ -446,7 +587,8 @@ impl GitHub {
             self.get_json(&events_url, oauth_token, use_etag),
         );
 
-        let any_new_activity = matches!(repos_res, Ok(Some(_))) || matches!(events_res, Ok(Some(_)));
+        let any_new_activity =
+            matches!(repos_res, Ok(Some(_))) || matches!(events_res, Ok(Some(_)));
         let search_due = if !use_etag || oauth_token.is_some() {
             true
         } else if any_new_activity {
@@ -465,8 +607,12 @@ impl GitHub {
                 }
                 map.insert(login.to_owned(), Instant::now());
             }
-            let search_involves = format!("{API}/search/issues?q=involves:{login}+is:public&sort=updated&order=desc&per_page=10");
-            let search_user = format!("{API}/search/issues?q=user:{login}+is:public&sort=updated&order=desc&per_page=10");
+            let search_involves = format!(
+                "{API}/search/issues?q=involves:{login}+is:public&sort=updated&order=desc&per_page=10"
+            );
+            let search_user = format!(
+                "{API}/search/issues?q=user:{login}+is:public&sort=updated&order=desc&per_page=10"
+            );
             tokio::join!(
                 self.get_json(&search_involves, oauth_token, use_etag),
                 self.get_json(&search_user, oauth_token, use_etag),
@@ -500,7 +646,13 @@ impl GitHub {
                             .to_owned();
                         if use_etag
                             && !pushed_at.is_empty()
-                            && self.repo_pushed_at.lock().unwrap().get(&full).map(String::as_str) == Some(pushed_at.as_str())
+                            && self
+                                .repo_pushed_at
+                                .lock()
+                                .unwrap()
+                                .get(&full)
+                                .map(String::as_str)
+                                == Some(pushed_at.as_str())
                         {
                             return None;
                         }
@@ -509,11 +661,13 @@ impl GitHub {
                     .take(5)
                     .collect();
 
-                let mut commit_fetches = stream::iter(public_repos.into_iter().map(|(full, branch, pushed_at)| async move {
-                    let commits_url = format!("{API}/repos/{full}/commits?per_page=5");
-                    let res = self.get_json(&commits_url, oauth_token, use_etag).await;
-                    (full, branch, pushed_at, res)
-                }))
+                let mut commit_fetches = stream::iter(public_repos.into_iter().map(
+                    |(full, branch, pushed_at)| async move {
+                        let commits_url = format!("{API}/repos/{full}/commits?per_page=5");
+                        let res = self.get_json(&commits_url, oauth_token, use_etag).await;
+                        (full, branch, pushed_at, res)
+                    },
+                ))
                 .buffer_unordered(4);
 
                 while let Some((full, branch, pushed_at, res)) = commit_fetches.next().await {
@@ -539,7 +693,9 @@ impl GitHub {
                                 self.repo_pushed_at.lock().unwrap().insert(full, pushed_at);
                             }
                         }
-                        Err(err) => tracing::debug!(error = %err, repo = %full, "public commits fetch skipped"),
+                        Err(err) => {
+                            tracing::debug!(error = %err, repo = %full, "public commits fetch skipped")
+                        }
                     }
                 }
             }
@@ -558,14 +714,20 @@ impl GitHub {
                     .filter_map(|ev| {
                         let repo = ev.pointer("/repo/name")?.as_str()?;
                         let head = ev.pointer("/payload/head")?.as_str()?;
-                        if !valid_repo_slug(repo) || head.is_empty() || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        if !valid_repo_slug(repo)
+                            || head.is_empty()
+                            || !head.bytes().all(|b| b.is_ascii_hexdigit())
+                        {
                             return None;
                         }
                         let key = format!("{repo}@{head}");
                         if seen_keys.contains(&key) {
                             return None;
                         }
-                        let git_ref = ev.pointer("/payload/ref").and_then(Value::as_str).unwrap_or("");
+                        let git_ref = ev
+                            .pointer("/payload/ref")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         let branch = git_ref
                             .strip_prefix("refs/heads/")
                             .filter(|b| !b.is_empty())
@@ -575,11 +737,13 @@ impl GitHub {
                     .take(3)
                     .collect();
 
-                let mut push_fetches = stream::iter(push_candidates.into_iter().map(|(repo, head, branch)| async move {
-                    let commit_url = format!("{API}/repos/{repo}/commits/{head}");
-                    let res = self.get_json(&commit_url, oauth_token, use_etag).await;
-                    (repo, branch, res)
-                }))
+                let mut push_fetches = stream::iter(push_candidates.into_iter().map(
+                    |(repo, head, branch)| async move {
+                        let commit_url = format!("{API}/repos/{repo}/commits/{head}");
+                        let res = self.get_json(&commit_url, oauth_token, use_etag).await;
+                        (repo, branch, res)
+                    },
+                ))
                 .buffer_unordered(3);
 
                 while let Some((repo, branch, res)) = push_fetches.next().await {
@@ -600,7 +764,12 @@ impl GitHub {
         for search_res in [search1_res, search2_res] {
             match search_res {
                 Ok(Some(search_val)) => {
-                    for item in search_val.get("items").and_then(Value::as_array).into_iter().flatten() {
+                    for item in search_val
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
                         if let Some(act) = search_item_to_act(item) {
                             let dedupe_key = format!("{}:{}", act.kind, act.key);
                             if seen_keys.insert(dedupe_key) {
@@ -638,7 +807,9 @@ impl GitHub {
 
         while let Some((repo, num, res)) = pr_fetches.next().await {
             if let Ok(Some(pr_val)) = res
-                && let Some(act) = acts.iter_mut().find(|a| a.kind == "pull_request" && a.key == format!("{repo}#{num}"))
+                && let Some(act) = acts
+                    .iter_mut()
+                    .find(|a| a.kind == "pull_request" && a.key == format!("{repo}#{num}"))
                 && let Some(obj) = act.base.as_object_mut()
             {
                 if let Some(branch) = pr_val.pointer("/head/ref").and_then(Value::as_str) {
@@ -692,7 +863,9 @@ impl GitHub {
           }
         }"#;
 
-        let body = self.graphql(installation, QUERY, json!({ "owner": owner, "name": name })).await?;
+        let body = self
+            .graphql(installation, QUERY, json!({ "owner": owner, "name": name }))
+            .await?;
         let Some(repo) = body.pointer("/data/repository").filter(|v| !v.is_null()) else {
             return Ok(vec![]);
         };
@@ -701,14 +874,18 @@ impl GitHub {
         let mask = |v: Value| if private { Value::Null } else { v };
         let mut acts = Vec::new();
 
-        let branch = repo.pointer("/defaultBranchRef/name").and_then(Value::as_str);
+        let branch = repo
+            .pointer("/defaultBranchRef/name")
+            .and_then(Value::as_str);
         for c in repo
             .pointer("/defaultBranchRef/target/history/nodes")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            let Some(oid) = c["oid"].as_str() else { continue };
+            let Some(oid) = c["oid"].as_str() else {
+                continue;
+            };
             let at = parse_ts(c["committedDate"].as_str());
             let author = c.pointer("/author/user/login").and_then(Value::as_str);
             acts.push(Act {
@@ -716,8 +893,8 @@ impl GitHub {
                 key: format!("{full}@{oid}"),
                 defaults: Value::Null,
                 base: json!({
-                    "sha": c["abbreviatedOid"].as_str().unwrap_or(&oid[..oid.len().min(7)]),
-                    "message": mask(c["messageHeadline"].clone()),
+                    "sha": c["abbreviatedOid"].as_str().map(str::to_owned).unwrap_or_else(|| short_sha(oid)),
+                    "message": mask(c["messageHeadline"].as_str().map(|m| json!(truncate_chars(m, 500))).unwrap_or_else(|| c["messageHeadline"].clone())),
                     "repo": mask(json!(full)),
                     "branch": mask(json!(branch)),
                     "private": private,
@@ -735,7 +912,9 @@ impl GitHub {
             .into_iter()
             .flatten()
         {
-            let Some(number) = pr["number"].as_i64() else { continue };
+            let Some(number) = pr["number"].as_i64() else {
+                continue;
+            };
             let enrich = parse_enrichment(pr);
             let at = parse_ts(pr["updatedAt"].as_str());
             let state = if pr["merged"].as_bool() == Some(true) {
@@ -778,7 +957,9 @@ impl GitHub {
             .into_iter()
             .flatten()
         {
-            let Some(number) = i["number"].as_i64() else { continue };
+            let Some(number) = i["number"].as_i64() else {
+                continue;
+            };
             let at = parse_ts(i["updatedAt"].as_str());
             let state = match i["state"].as_str() {
                 Some("CLOSED") => "closed",
@@ -816,12 +997,15 @@ impl GitHub {
 }
 
 pub fn rest_commit_to_act(full: &str, branch: Option<&str>, c: &Value) -> Option<Act> {
+    if !valid_repo_slug(full) {
+        return None;
+    }
     let sha_full = c.get("sha").and_then(Value::as_str)?;
-    let short = &sha_full[..sha_full.len().min(7)];
+    let short = short_sha(sha_full);
     let msg = c
         .pointer("/commit/message")
         .and_then(Value::as_str)
-        .map(|m| m.lines().next().unwrap_or("").to_owned());
+        .map(|m| truncate_chars(m.lines().next().unwrap_or(""), 500));
     let ts_raw = c
         .pointer("/commit/committer/date")
         .and_then(Value::as_str)
@@ -854,6 +1038,7 @@ pub fn search_item_to_act(item: &Value) -> Option<Act> {
         .get("repository_url")
         .and_then(Value::as_str)
         .and_then(|u| u.strip_prefix("https://api.github.com/repos/"))
+        .filter(|slug| valid_repo_slug(slug))
         .map(str::to_owned)?;
     let at = parse_ts(item.get("updated_at").and_then(Value::as_str));
     let author = item.pointer("/user/login").and_then(Value::as_str);
@@ -966,24 +1151,6 @@ fn parse_enrichment(pr: &Value) -> Enrichment {
     }
 }
 
-fn valid_repo_slug(repo: &str) -> bool {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return false;
-    };
-    if name.contains('/') {
-        return false;
-    }
-    [owner, name].into_iter().all(|part| {
-        !part.is_empty()
-            && part.len() <= 100
-            && part != "."
-            && part != ".."
-            && part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    })
-}
-
 fn parse_ts(raw: Option<&str>) -> DateTime<Utc> {
     raw.and_then(|x| DateTime::parse_from_rfc3339(x).ok())
         .map(|d| d.with_timezone(&Utc))
@@ -1075,10 +1242,10 @@ pub fn parse_commits_atom(full: &str, xml: &str) -> Vec<Act> {
             continue;
         }
 
-        let short = &sha_full[..sha_full.len().min(7)];
+        let short = short_sha(sha_full);
         let msg = extract_tag(entry, "title")
             .map(|t| unescape_xml(t.trim()))
-            .and_then(|t| t.lines().next().map(|l| l.trim().to_owned()));
+            .and_then(|t| t.lines().next().map(|l| truncate_chars(l.trim(), 500)));
         let at = parse_ts(extract_tag(entry, "updated").map(str::trim));
         let author = extract_tag(entry, "author")
             .and_then(|a| extract_tag(a, "name"))
@@ -1124,7 +1291,10 @@ mod tests {
         });
         let commit_act = rest_commit_to_act("example-user/demo-repo", Some("main"), &c).unwrap();
         assert_eq!(commit_act.kind, "commit");
-        assert_eq!(commit_act.key, "example-user/demo-repo@eb8ce09abcdef1234567890");
+        assert_eq!(
+            commit_act.key,
+            "example-user/demo-repo@eb8ce09abcdef1234567890"
+        );
         assert_eq!(commit_act.base["sha"], "eb8ce09");
         assert_eq!(commit_act.base["message"], "Update title");
         assert_eq!(commit_act.base["branch"], "main");
@@ -1180,7 +1350,10 @@ mod tests {
         "#;
         assert_eq!(
             parse_repo_updates(html, "itsvarp"),
-            vec![("itsvarp/taggle".to_owned(), "2026-11-12T19:18:50Z".to_owned())]
+            vec![(
+                "itsvarp/taggle".to_owned(),
+                "2026-11-12T19:18:50Z".to_owned()
+            )]
         );
 
         let atom = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1198,7 +1371,10 @@ mod tests {
 </feed>"#;
         let acts = parse_commits_atom("itsvarp/taggle", atom);
         assert_eq!(acts.len(), 1);
-        assert_eq!(acts[0].key, "itsvarp/taggle@2caeecc5d7ccbdf5820479954c0bb4beb4ec64bc");
+        assert_eq!(
+            acts[0].key,
+            "itsvarp/taggle@2caeecc5d7ccbdf5820479954c0bb4beb4ec64bc"
+        );
         assert_eq!(acts[0].base["sha"], "2caeecc");
         assert_eq!(acts[0].base["message"], "perf(ingest): poll & isolate");
         assert_eq!(acts[0].base["branch"], "main");

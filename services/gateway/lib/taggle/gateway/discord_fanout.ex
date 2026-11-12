@@ -19,21 +19,31 @@ defmodule Taggle.Gateway.DiscordFanout do
   end
 
   @impl true
-  def handle_info({:redix_pubsub, _pid, _ref, :pmessage, %{channel: @prefix <> user_id, payload: payload}}, state) do
+  def handle_info(
+        {:redix_pubsub, _pid, _ref, :pmessage, %{channel: @prefix <> user_id, payload: payload}},
+        state
+      ) do
     entries =
       Registry.lookup(Taggle.Gateway.Subs, "dc:" <> user_id) ++
         Registry.lookup(Taggle.Gateway.Subs, "dc:all")
 
-    entries
-    |> Enum.uniq_by(fn {pid, _} -> pid end)
-    |> Enum.each(fn {pid, _} -> send(pid, {:discord_presence_update, payload}) end)
+    unique_entries = Enum.uniq_by(entries, fn {pid, _} -> pid end)
+
+    if unique_entries == [] do
+      Taggle.Gateway.Metrics.inc(:fanout_skipped_total)
+    else
+      Enum.each(unique_entries, fn {pid, _} -> send(pid, {:discord_presence_update, payload}) end)
+      Taggle.Gateway.Metrics.inc(:fanout_dispatched_total, length(unique_entries))
+    end
 
     {:noreply, state}
   end
 
   def handle_info({:redix_pubsub, _pid, _ref, type, _}, state)
       when type in [:psubscribed, :disconnected] do
-    if type == :disconnected, do: Logger.warning("redis discord pubsub disconnected, redix will reconnect")
+    if type == :disconnected,
+      do: Logger.warning("redis discord pubsub disconnected, redix will reconnect")
+
     {:noreply, state}
   end
 

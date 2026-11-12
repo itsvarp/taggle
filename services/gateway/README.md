@@ -1,12 +1,15 @@
 # Taggle Gateway
 
-Elixir service that exposes Taggle over REST + WebSocket.
+Elixir service that exposes Taggle over REST, SVG embeds, self-hosted JS SDK, Prometheus metrics, and WebSocket.
 
 - Discord presences: `GET /v1/discord/users/:id`, `GET /v1/users/:id`
 - GitHub activity: `GET /v1/github/users/:login`, `GET /v1/users/:login`
+- Unified profile: `GET /v1/profiles/:id` (resolves Discord ID or GitHub login to `{discord, github}`)
+- Pure-vector SVG embeds: `GET /v1/users/:id/card.svg`, `GET /v1/profiles/:id/card.svg`, `GET /v1/users/:id/badge.svg`
+- Self-hosted Web Component & SDK: `GET /taggle.js` (`TaggleClient` + `<taggle-card>`)
 - WebSocket: `/socket` (`INIT_STATE`, `PRESENCE_UPDATE`, `ACTIVITY_UPDATE`)
-- OAuth: `/auth/github`, `/auth/discord`
-- KV + API keys: portal at `/`
+- Observability: `GET /health` (Postgres + Redis check), `GET /metrics` (Prometheus)
+- Account linking, API keys, and KV management happen via Discord slash commands (`/connect`, `/apikey`, `/kv`, `/status`) handled by `services/ingest`, plus Bearer-authenticated KV REST endpoints (`/v1/*/kv`).
 
 Run locally:
 
@@ -21,11 +24,10 @@ Environment:
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres |
 | `REDIS_URL` | yes | Redis |
-| `SESSION_SECRET` | production | signs session cookies |
-| `GITHUB_APP_CLIENT_ID` / `_SECRET` | for GitHub OAuth | GitHub sign-in |
-| `GITHUB_APP_SLUG` | optional | portal install link |
-| `DISCORD_CLIENT_ID` / `_SECRET` | for Discord KV | Discord sign-in |
-| `DISCORD_INVITE_URL` | optional | portal invite link |
-| `INGEST_URL` | optional | manual GitHub sync target |
+| `PORT` | optional | HTTP/WS listen port (default `4000`) |
+| `RATE_LIMIT_READ_RPM` | optional | Per-IP read/WS requests per minute (default `120`) |
+| `RATE_LIMIT_KV_RPM` | optional | Per-IP KV write requests per minute (default `30`) |
+| `TRUST_PROXY` | optional | Set `true` behind a trusted reverse proxy to read `x-forwarded-for` |
+| `METRICS_TOKEN` | optional | If set, `GET /metrics` requires `Authorization: Bearer <token>` |
 
 The gateway never receives `DISCORD_BOT_TOKEN`; that belongs to `services/ingest`.

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust-ingest:
+    name: Rust Ingest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ingest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/ingest
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  elixir-gateway:
+    name: Elixir Gateway
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: taggle
+          POSTGRES_PASSWORD: taggle
+          POSTGRES_DB: taggle
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://taggle:taggle@localhost:5433/taggle
+      REDIS_URL: redis://localhost:6380
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.5"
+          otp-version: "29"
+      - name: Apply database migrations
+        run: |
+          for f in migrations/*.sql; do
+            PGPASSWORD=taggle psql -h localhost -p 5433 -U taggle -d taggle -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: Install deps & verify
+        working-directory: services/gateway
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+          mix format --check-formatted
+          mix compile --warnings-as-errors
+          mix test

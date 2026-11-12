@@ -43,7 +43,10 @@ impl Config {
         let discord = match non_empty("DISCORD_BOT_TOKEN") {
             Some(bot_token) => {
                 let guild_ids = parse_guild_ids(non_empty("DISCORD_GUILD_IDS").as_deref())?;
-                Some(DiscordConfig { bot_token, guild_ids })
+                Some(DiscordConfig {
+                    bot_token,
+                    guild_ids,
+                })
             }
             None => None,
         };
@@ -51,8 +54,12 @@ impl Config {
         Ok(Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://taggle:taggle@localhost:5433/taggle".into()),
-            redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6380".into()),
-            port: std::env::var("INGEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4001),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://localhost:6380".into()),
+            port: std::env::var("INGEST_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(4001),
             github_client_id,
             github,
             discord,
@@ -62,7 +69,9 @@ impl Config {
 
 /// Parses `DISCORD_GUILD_IDS` as a comma/space separated list of snowflakes.
 fn parse_guild_ids(raw: Option<&str>) -> Result<Vec<u64>> {
-    let Some(raw) = raw else { return Ok(Vec::new()) };
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
 
     let mut ids = Vec::new();
     for part in raw.split(|c: char| c == ',' || c.is_whitespace()) {

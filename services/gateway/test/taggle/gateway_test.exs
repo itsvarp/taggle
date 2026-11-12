@@ -61,7 +61,12 @@ defmodule Taggle.GatewayTest do
       discord_id = "9" <> Integer.to_string(System.unique_integer([:positive]))
 
       on_exit(fn ->
-        Postgrex.query!(:pg, "DELETE FROM discord_github_links WHERE discord_user_id = $1 OR github_login = $2", [discord_id, login])
+        Postgrex.query!(
+          :pg,
+          "DELETE FROM discord_github_links WHERE discord_user_id = $1 OR github_login = $2",
+          [discord_id, login]
+        )
+
         Postgrex.query!(:pg, "DELETE FROM snapshots WHERE login = $1", [login])
         Postgrex.query!(:pg, "DELETE FROM user_kv WHERE login = $1", [login])
         Postgrex.query!(:pg, "DELETE FROM installations WHERE account_login = $1", [login])
@@ -91,7 +96,9 @@ defmodule Taggle.GatewayTest do
 
       conn = conn(:get, "/v1/users/definitelynobody999") |> Router.call(@opts)
       assert conn.status == 404
-      assert %{"success" => false, "error" => %{"code" => "user_not_monitored"}} = JSON.decode!(conn.resp_body)
+
+      assert %{"success" => false, "error" => %{"code" => "user_not_monitored"}} =
+               JSON.decode!(conn.resp_body)
 
       conn = conn(:get, "/v1/users/bad%2Fid") |> Router.call(@opts)
       assert conn.status == 404
@@ -106,13 +113,19 @@ defmodule Taggle.GatewayTest do
       assert JSON.decode!(conn.resp_body)["error"]["code"] == "user_not_monitored"
     end
 
-    test "read-through cache restores Redis from Postgres on miss", %{login: login, id: id, discord_id: discord_id} do
+    test "read-through cache restores Redis from Postgres on miss", %{
+      login: login,
+      id: id,
+      discord_id: discord_id
+    } do
       GitHubStore.upsert_user_from_oauth(%{id: id, login: login, name: "Test", avatar_url: nil})
+
       Postgrex.query!(
         :pg,
         "INSERT INTO discord_github_links (discord_user_id, github_id, github_login) VALUES ($1, $2, $3)",
         [discord_id, id, login]
       )
+
       Redix.command!(:redix, ["DEL", "taggle:state:" <> login])
 
       conn = conn(:get, "/v1/users/" <> login) |> Router.call(@opts)
@@ -125,13 +138,19 @@ defmodule Taggle.GatewayTest do
       assert is_binary(raw)
     end
 
-    test "GitHub KV update requires API key and broadcasts via Redis pubsub", %{login: login, id: id, discord_id: discord_id} do
+    test "GitHub KV update requires API key and broadcasts via Redis pubsub", %{
+      login: login,
+      id: id,
+      discord_id: discord_id
+    } do
       GitHubStore.upsert_user_from_oauth(%{id: id, login: login, name: "Test", avatar_url: nil})
+
       Postgrex.query!(
         :pg,
         "INSERT INTO discord_github_links (discord_user_id, github_id, github_login) VALUES ($1, $2, $3)",
         [discord_id, id, login]
       )
+
       {:ok, api_key} = GitHubStore.rotate_api_key(login)
 
       unauth =
@@ -173,7 +192,9 @@ defmodule Taggle.GatewayTest do
       assert JSON.decode!(deleted.resp_body)["data"] == %{"theme" => "dark"}
     end
 
-    test "Discord presence is served from Postgres and repopulates Redis", %{discord_id: discord_id} do
+    test "Discord presence is served from Postgres and repopulates Redis", %{
+      discord_id: discord_id
+    } do
       presence = %{
         "discord_user" => %{
           "id" => discord_id,
@@ -215,7 +236,9 @@ defmodule Taggle.GatewayTest do
       assert is_binary(raw)
     end
 
-    test "Discord KV requires an API key and broadcasts PRESENCE_UPDATE", %{discord_id: discord_id} do
+    test "Discord KV requires an API key and broadcasts PRESENCE_UPDATE", %{
+      discord_id: discord_id
+    } do
       presence = %{
         "discord_user" => %{"id" => discord_id, "username" => "tester"},
         "discord_status" => "online",
@@ -238,7 +261,11 @@ defmodule Taggle.GatewayTest do
       {:ok, api_key} = DiscordStore.rotate_api_key(discord_id)
 
       unauth =
-        conn(:put, "/v1/discord/users/#{discord_id}/kv/location", JSON.encode!(%{value: "somewhere"}))
+        conn(
+          :put,
+          "/v1/discord/users/#{discord_id}/kv/location",
+          JSON.encode!(%{value: "somewhere"})
+        )
         |> put_req_header("content-type", "application/json")
         |> Router.call(@opts)
 
@@ -247,13 +274,21 @@ defmodule Taggle.GatewayTest do
       Registry.register(Taggle.Gateway.Subs, "dc:" <> discord_id, nil)
 
       ok =
-        conn(:put, "/v1/discord/users/#{discord_id}/kv/location", JSON.encode!(%{value: "somewhere"}))
+        conn(
+          :put,
+          "/v1/discord/users/#{discord_id}/kv/location",
+          JSON.encode!(%{value: "somewhere"})
+        )
         |> put_req_header("content-type", "application/json")
         |> put_req_header("authorization", "Bearer " <> api_key)
         |> Router.call(@opts)
 
       assert ok.status == 200
-      assert JSON.decode!(ok.resp_body) == %{"success" => true, "data" => %{"location" => "somewhere"}}
+
+      assert JSON.decode!(ok.resp_body) == %{
+               "success" => true,
+               "data" => %{"location" => "somewhere"}
+             }
 
       assert_receive {:discord_presence_update, payload}, 1_000
       assert JSON.decode!(payload)["kv"] == %{"location" => "somewhere"}
@@ -269,7 +304,9 @@ defmodule Taggle.GatewayTest do
       assert JSON.decode!(bad_key.resp_body)["error"]["code"] == "invalid_key"
     end
 
-    test "avatar quicklink returns 404 when Discord user is not monitored", %{discord_id: discord_id} do
+    test "avatar quicklink returns 404 when Discord user is not monitored", %{
+      discord_id: discord_id
+    } do
       conn = conn(:get, "/#{discord_id}.png") |> Router.call(@opts)
       assert conn.status == 404
     end

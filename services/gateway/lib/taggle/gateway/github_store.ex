@@ -1,30 +1,42 @@
 defmodule Taggle.Gateway.GitHubStore do
   @moduledoc """
-  Redis hot-cache + PostgreSQL read-through store and KV management.
+  Redis hot-cache + PostgreSQL read-through store, linked lookups and KV management.
   """
   require Logger
 
+  alias Taggle.Gateway.{GitHubAuth, Ids, Metrics}
+
   @max_kv_pairs 512
+  @max_value_bytes 30_000
+
+  def state_key(login), do: "taggle:state:" <> login
 
   @doc "Fetches the serialized JSON snapshot from Redis, falling back to Postgres on miss."
   def get_snapshot_raw(login) when is_binary(login) do
-    key = "taggle:state:" <> login
+    key = state_key(login)
 
     case Redix.command(:redix, ["GET", key]) do
       {:ok, raw} when is_binary(raw) ->
+        Metrics.inc(:cache_hits_total)
         {:ok, raw}
 
       {:ok, nil} ->
+        Metrics.inc(:cache_misses_total)
         read_through_pg(login, key)
 
       {:error, reason} ->
+        Metrics.inc(:cache_misses_total)
         Logger.warning("redis read failed, falling back to pg: #{inspect(reason)}")
         read_through_pg(login, nil)
     end
   end
 
   def connected?(login) when is_binary(login) do
-    case Postgrex.query(:pg, "SELECT EXISTS(SELECT 1 FROM discord_github_links WHERE github_login = $1)", [login]) do
+    case Postgrex.query(
+           :pg,
+           "SELECT EXISTS(SELECT 1 FROM discord_github_links WHERE github_login = $1)",
+           [login]
+         ) do
       {:ok, %Postgrex.Result{rows: [[true]]}} -> true
       _ -> false
     end
@@ -32,8 +44,33 @@ defmodule Taggle.Gateway.GitHubStore do
 
   def connected?(_), do: false
 
+  def linked_discord_id(login) when is_binary(login) do
+    if Ids.github_login?(login) do
+      case Postgrex.query(
+             :pg,
+             "SELECT discord_user_id FROM discord_github_links WHERE github_login = $1 LIMIT 1",
+             [login]
+           ) do
+        {:ok, %Postgrex.Result{rows: [[discord_id]]}} -> {:ok, discord_id}
+        {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  @doc "Fast-path raw JSON binary read for unfiltered REST responses."
+  def get_snapshot_json(login) when is_binary(login) do
+    if Ids.github_login?(login) and connected?(login) do
+      get_snapshot_raw(login)
+    else
+      {:ok, nil}
+    end
+  end
+
   def get_snapshot(login) do
-    if Taggle.Gateway.Ids.github_login?(login) and connected?(login) do
+    if Ids.github_login?(login) and connected?(login) do
       case get_snapshot_raw(login) do
         {:ok, nil} ->
           {:ok, nil}
@@ -44,7 +81,7 @@ defmodule Taggle.Gateway.GitHubStore do
               {:ok, decoded}
 
             {:error, _} ->
-              with {:ok, fresh} when is_binary(fresh) <- read_through_pg(login, "taggle:state:" <> login),
+              with {:ok, fresh} when is_binary(fresh) <- read_through_pg(login, state_key(login)),
                    {:ok, decoded} <- JSON.decode(fresh) do
                 {:ok, decoded}
               else
@@ -61,7 +98,56 @@ defmodule Taggle.Gateway.GitHubStore do
     end
   end
 
+  @doc "Batch-fetches decoded snapshots for multiple GitHub logins using one PG check + Redis MGET."
+  def get_snapshots_batch([]), do: %{}
+
+  def get_snapshots_batch(logins) do
+    valid_logins = Enum.filter(logins, &Ids.github_login?/1) |> Enum.uniq()
+    if valid_logins == [], do: %{}
+
+    connected_logins =
+      case Postgrex.query(
+             :pg,
+             "SELECT DISTINCT github_login FROM discord_github_links WHERE github_login = ANY($1::text[])",
+             [valid_logins]
+           ) do
+        {:ok, %Postgrex.Result{rows: rows}} -> Enum.map(rows, &hd/1)
+        _ -> []
+      end
+
+    if connected_logins == [] do
+      %{}
+    else
+      keys = Enum.map(connected_logins, &state_key/1)
+
+      cached =
+        case Redix.command(:redix, ["MGET" | keys]) do
+          {:ok, values} when is_list(values) -> Enum.zip(connected_logins, values)
+          _ -> Enum.map(connected_logins, &{&1, nil})
+        end
+
+      Enum.reduce(cached, %{}, fn
+        {login, raw}, acc when is_binary(raw) ->
+          Metrics.inc(:cache_hits_total)
+
+          case JSON.decode(raw) do
+            {:ok, decoded} -> Map.put(acc, login, decoded)
+            _ -> put_if_present(acc, login, get_snapshot(login))
+          end
+
+        {login, nil}, acc ->
+          Metrics.inc(:cache_misses_total)
+          put_if_present(acc, login, get_snapshot(login))
+      end)
+    end
+  end
+
+  defp put_if_present(acc, login, {:ok, %{} = map}), do: Map.put(acc, login, map)
+  defp put_if_present(acc, _login, _), do: acc
+
   defp read_through_pg(login, redis_key) do
+    Metrics.inc(:pg_fallbacks_total)
+
     case Postgrex.query(:pg, "SELECT data FROM snapshots WHERE login = $1", [login]) do
       {:ok, %Postgrex.Result{rows: [[data]]}} ->
         raw = JSON.encode!(data)
@@ -78,7 +164,7 @@ defmodule Taggle.Gateway.GitHubStore do
 
   def upsert_user_from_oauth(%{id: id, login: login, name: name, avatar_url: avatar_url}) do
     login = String.downcase(login)
-    if not Taggle.Gateway.Ids.github_login?(login), do: raise(ArgumentError, "invalid github login")
+    if not Ids.github_login?(login), do: raise(ArgumentError, "invalid github login")
 
     Postgrex.query!(
       :pg,
@@ -120,7 +206,7 @@ defmodule Taggle.Gateway.GitHubStore do
          ) do
       {:ok, %Postgrex.Result{num_rows: 1}} ->
         raw = JSON.encode!(initial)
-        _ = Redix.command(:redix, ["SET", "taggle:state:" <> login, raw])
+        _ = Redix.command(:redix, ["SET", state_key(login), raw])
         :ok
 
       _ ->
@@ -129,11 +215,14 @@ defmodule Taggle.Gateway.GitHubStore do
   end
 
   def rotate_api_key(login) do
-    if Taggle.Gateway.Ids.github_login?(login) do
+    if Ids.github_login?(login) do
       token = "tggl_" <> (:crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false))
       hash = sha256_hex(token)
 
-      case Postgrex.query(:pg, "UPDATE users SET api_key_hash = $1 WHERE login = $2", [hash, login]) do
+      case Postgrex.query(:pg, "UPDATE users SET api_key_hash = $1 WHERE login = $2", [
+             hash,
+             login
+           ]) do
         {:ok, %Postgrex.Result{num_rows: 1}} -> {:ok, token}
         _ -> :not_found
       end
@@ -142,8 +231,8 @@ defmodule Taggle.Gateway.GitHubStore do
     end
   end
 
-  def valid_api_key?(login, token) when is_binary(token) and byte_size(token) > 0 do
-    if Taggle.Gateway.Ids.github_login?(login) and connected?(login) do
+  def valid_api_key?(login, token) when is_binary(token) do
+    if Ids.github_login?(login) and GitHubAuth.valid_token_shape?(token) and connected?(login) do
       verify_api_key(login, token)
     else
       false
@@ -163,7 +252,7 @@ defmodule Taggle.Gateway.GitHubStore do
   end
 
   def put_kv(login, pairs) when is_map(pairs) do
-    with true <- Taggle.Gateway.Ids.github_login?(login),
+    with true <- Ids.github_login?(login),
          :ok <- validate_kv_pairs(pairs) do
       Postgrex.transaction(:pg, fn conn ->
         Postgrex.query!(conn, "SELECT pg_advisory_xact_lock(hashtext('ghkv:' || $1))", [login])
@@ -196,7 +285,7 @@ defmodule Taggle.Gateway.GitHubStore do
   end
 
   def delete_kv(login, key) when is_binary(key) do
-    with true <- Taggle.Gateway.Ids.github_login?(login),
+    with true <- Ids.github_login?(login),
          true <- Regex.match?(~r/^[a-zA-Z0-9._-]{1,64}$/, key) do
       Postgrex.transaction(:pg, fn conn ->
         Postgrex.query!(conn, "SELECT pg_advisory_xact_lock(hashtext('ghkv:' || $1))", [login])
@@ -236,7 +325,7 @@ defmodule Taggle.Gateway.GitHubStore do
   end
 
   defp finalize_kv_publish({:ok, {:publish, kv, raw}}, login) do
-    _ = Redix.command(:redix, ["SET", "taggle:state:" <> login, raw])
+    _ = Redix.command(:redix, ["SET", state_key(login), raw])
     _ = Redix.command(:redix, ["PUBLISH", "taggle:events:" <> login, raw])
     {:ok, kv}
   end
@@ -255,7 +344,7 @@ defmodule Taggle.Gateway.GitHubStore do
         not (is_binary(v) or is_number(v) or is_boolean(v)) ->
           {:halt, {:error, "invalid_value"}}
 
-        byte_size(to_string(v)) > 30_000 ->
+        byte_size(to_string(v)) > @max_value_bytes ->
           {:halt, {:error, "value_too_large"}}
 
         true ->

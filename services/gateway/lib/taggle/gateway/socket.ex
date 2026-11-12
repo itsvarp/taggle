@@ -13,26 +13,56 @@ defmodule Taggle.Gateway.Socket do
   """
   @behaviour WebSock
 
-  alias Taggle.Gateway.{DiscordStore, Filter, GitHubStore, Ids}
+  alias Taggle.Gateway.{DiscordStore, Filter, GitHubStore, Ids, Metrics}
 
   @heartbeat_ms 30_000
   @max_subs 20
   @init_cooldown_ms 500
+  @msg_window_ms 10_000
+  @msg_soft_limit 40
+  @msg_hard_limit 100
   @all_key "dc:all"
 
   @impl true
   def init(_args) do
+    Metrics.inc(:ws_connections_total)
+    Metrics.inc(:ws_connections_active)
+    Metrics.inc(:ws_messages_out_total)
     timer = Process.send_after(self(), :heartbeat_timeout, @heartbeat_ms * 2)
 
     {:push, {:text, encode(%{op: 1, d: %{heartbeat_interval: @heartbeat_ms}})},
-     %{timer: timer, subs: MapSet.new(), filter: nil, last_init_at: nil}}
+     %{
+       timer: timer,
+       subs: MapSet.new(),
+       filter: nil,
+       last_init_at: nil,
+       msg_window_start: System.monotonic_time(:millisecond),
+       msg_count: 0
+     }}
   end
 
   @impl true
   def handle_in({text, [opcode: :text]}, state) do
+    Metrics.inc(:ws_messages_in_total)
+
+    case check_inbound_rate(state) do
+      {:hard_limit, new_state} ->
+        {:stop, :normal, {4008, "rate limit exceeded"}, new_state}
+
+      {:soft_limit, new_state} ->
+        push_error(new_state, "rate_limited")
+
+      {:ok, new_state} ->
+        handle_text_frame(text, new_state)
+    end
+  end
+
+  def handle_in(_, state), do: {:ok, state}
+
+  defp handle_text_frame(text, state) do
     case JSON.decode(text) do
       {:ok, %{"op" => 3}} ->
-        {:push, {:text, encode(%{op: 3})}, reset_timer(state)}
+        push_text(encode(%{op: 3}), reset_timer(state))
 
       {:ok, %{"op" => 2, "d" => d}} when is_map(d) ->
         subscribe(d, state)
@@ -54,35 +84,42 @@ defmodule Taggle.Gateway.Socket do
     end
   end
 
-  def handle_in(_, state), do: {:ok, state}
-
   @impl true
-  def handle_info({:activity_update, login, payload}, %{subs: subs} = state) when is_binary(payload) do
+  def handle_info({:activity_update, login, payload}, %{subs: subs} = state)
+      when is_binary(payload) do
     if MapSet.member?(subs, "gh:" <> login) do
-      frame =
-        if state.filter do
-          data = payload |> JSON.decode!() |> Filter.apply(state.filter)
-          encode(%{op: 0, t: "ACTIVITY_UPDATE", d: data})
-        else
-          # `payload` is already serialized JSON from ingest/store; wrap without decode+encode.
-          "{\"op\":0,\"t\":\"ACTIVITY_UPDATE\",\"d\":" <> payload <> "}"
-        end
+      if state.filter do
+        case JSON.decode(payload) do
+          {:ok, decoded} ->
+            data = Filter.apply(decoded, state.filter)
+            push_text(encode(%{op: 0, t: "ACTIVITY_UPDATE", d: data}), state)
 
-      {:push, {:text, frame}, state}
+          {:error, _} ->
+            {:ok, state}
+        end
+      else
+        # `payload` is already serialized JSON from ingest/store; wrap without decode+encode.
+        push_text("{\"op\":0,\"t\":\"ACTIVITY_UPDATE\",\"d\":" <> payload <> "}", state)
+      end
     else
       {:ok, state}
     end
   end
 
   def handle_info({:discord_presence_update, payload}, state) when is_binary(payload) do
-    {:push, {:text, "{\"op\":0,\"t\":\"PRESENCE_UPDATE\",\"d\":" <> payload <> "}"}, state}
+    push_text("{\"op\":0,\"t\":\"PRESENCE_UPDATE\",\"d\":" <> payload <> "}", state)
   end
 
-  def handle_info(:heartbeat_timeout, state), do: {:stop, :normal, {4004, "heartbeat timeout"}, state}
+  def handle_info(:heartbeat_timeout, state),
+    do: {:stop, :normal, {4004, "heartbeat timeout"}, state}
+
   def handle_info(_, state), do: {:ok, state}
 
   @impl true
-  def terminate(_reason, _state), do: :ok
+  def terminate(_reason, _state) do
+    Metrics.inc(:ws_connections_active, -1)
+    :ok
+  end
 
   defp subscribe(d, state) do
     now_ms = System.monotonic_time(:millisecond)
@@ -106,6 +143,7 @@ defmodule Taggle.Gateway.Socket do
       |> Enum.filter(&is_binary/1)
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
       |> Enum.take(@max_subs)
 
     {keys, subjects, invalid?} = classify(ids)
@@ -124,7 +162,10 @@ defmodule Taggle.Gateway.Socket do
         keys = if all?, do: MapSet.put(keys, @all_key), else: keys
         for key <- keys, do: Registry.register(Taggle.Gateway.Subs, key, nil)
 
-        filter = if is_map(d["filter"]), do: Map.take(d["filter"], ["types", "repos", "limit"]), else: nil
+        filter =
+          if is_map(d["filter"]),
+            do: Map.take(d["filter"], ["types", "repos", "limit"]),
+            else: nil
 
         init_state =
           if all? do
@@ -133,11 +174,14 @@ defmodule Taggle.Gateway.Socket do
               _ -> %{}
             end
           else
-            build_init_state(subjects, ids, filter)
+            build_init_state(subjects, filter)
           end
 
-        {:push, {:text, encode(%{op: 0, t: "INIT_STATE", d: init_state})},
-         %{state | subs: keys, filter: filter}}
+        push_text(encode(%{op: 0, t: "INIT_STATE", d: init_state}), %{
+          state
+          | subs: keys,
+            filter: filter
+        })
     end
   end
 
@@ -158,46 +202,42 @@ defmodule Taggle.Gateway.Socket do
     |> then(fn {keys, subjects, invalid?} -> {keys, Enum.reverse(subjects), invalid?} end)
   end
 
-  defp build_init_state(subjects, ids, filter) do
-    single? = length(ids) == 1
+  defp build_init_state([single], filter) do
+    case single do
+      {:discord, id} ->
+        case DiscordStore.get_presence(id) do
+          {:ok, presence} -> presence
+          _ -> nil
+        end
 
-    if single? do
-      case hd(subjects) do
-        {:discord, id} ->
-          case DiscordStore.get_presence(id) do
-            {:ok, presence} -> presence
-            _ -> nil
-          end
-
-        {:github, login, _raw} ->
-          case GitHubStore.get_snapshot(login) do
-            {:ok, snapshot} -> Filter.apply(snapshot, filter)
-            _ -> nil
-          end
-      end
-    else
-      Map.new(subjects, fn
-        {:discord, id} ->
-          presence =
-            case DiscordStore.get_presence(id) do
-              {:ok, p} -> p
-              _ -> nil
-            end
-
-          {id, presence}
-
-        {:github, login, raw} ->
-          snapshot =
-            case GitHubStore.get_snapshot(login) do
-              {:ok, s} -> Filter.apply(s, filter)
-              _ -> nil
-            end
-
-          {raw, snapshot}
-      end)
-      |> Enum.reject(fn {_id, value} -> is_nil(value) end)
-      |> Map.new()
+      {:github, login, _raw} ->
+        case GitHubStore.get_snapshot(login) do
+          {:ok, snapshot} -> Filter.apply(snapshot, filter)
+          _ -> nil
+        end
     end
+  end
+
+  defp build_init_state(subjects, filter) do
+    dc_ids = for {:discord, id} <- subjects, do: id
+    gh_logins = for {:github, login, _raw} <- subjects, do: login
+
+    presences = DiscordStore.get_presences_batch(dc_ids)
+    snapshots = GitHubStore.get_snapshots_batch(gh_logins)
+
+    Enum.reduce(subjects, %{}, fn
+      {:discord, id}, acc ->
+        case Map.get(presences, id) do
+          nil -> acc
+          p -> Map.put(acc, id, p)
+        end
+
+      {:github, login, raw}, acc ->
+        case Map.get(snapshots, login) do
+          nil -> acc
+          s -> Map.put(acc, raw, Filter.apply(s, filter))
+        end
+    end)
   end
 
   defp unsubscribe(d, state) do
@@ -227,7 +267,8 @@ defmodule Taggle.Gateway.Socket do
     keys = if all?, do: MapSet.put(keys, @all_key), else: keys
 
     # If the client had only `subscribe_to_all`, unsubscribing from all removes it.
-    keys = if all?, do: MapSet.union(keys, MapSet.filter(state.subs, &(&1 == @all_key))), else: keys
+    keys =
+      if all?, do: MapSet.union(keys, MapSet.filter(state.subs, &(&1 == @all_key))), else: keys
 
     for key <- keys, do: Registry.unregister(Taggle.Gateway.Subs, key)
 
@@ -239,7 +280,31 @@ defmodule Taggle.Gateway.Socket do
   end
 
   defp push_error(state, code) do
-    {:push, {:text, encode(%{op: 0, t: "ERROR", d: %{code: code}})}, state}
+    push_text(encode(%{op: 0, t: "ERROR", d: %{code: code}}), state)
+  end
+
+  defp push_text(frame, state) do
+    Metrics.inc(:ws_messages_out_total)
+    {:push, {:text, frame}, state}
+  end
+
+  defp check_inbound_rate(state) do
+    now = System.monotonic_time(:millisecond)
+
+    {window_start, count} =
+      if now - state.msg_window_start >= @msg_window_ms do
+        {now, 1}
+      else
+        {state.msg_window_start, state.msg_count + 1}
+      end
+
+    new_state = %{state | msg_window_start: window_start, msg_count: count}
+
+    cond do
+      count > @msg_hard_limit -> {:hard_limit, new_state}
+      count > @msg_soft_limit -> {:soft_limit, new_state}
+      true -> {:ok, new_state}
+    end
   end
 
   defp reset_timer(%{timer: t} = state) do

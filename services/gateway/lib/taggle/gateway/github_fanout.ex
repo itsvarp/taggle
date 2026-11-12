@@ -19,11 +19,18 @@ defmodule Taggle.Gateway.GitHubFanout do
   end
 
   @impl true
-  def handle_info({:redix_pubsub, _pid, _ref, :pmessage, %{channel: @prefix <> login, payload: payload}}, state) do
-    if Taggle.Gateway.GitHubStore.connected?(login) do
-      Registry.dispatch(Taggle.Gateway.Subs, "gh:" <> login, fn entries ->
-        for {pid, _} <- entries, do: send(pid, {:activity_update, login, payload})
-      end)
+  def handle_info(
+        {:redix_pubsub, _pid, _ref, :pmessage, %{channel: @prefix <> login, payload: payload}},
+        state
+      ) do
+    with true <- Taggle.Gateway.Ids.github_login?(login),
+         entries when entries != [] <- Registry.lookup(Taggle.Gateway.Subs, "gh:" <> login),
+         true <- Taggle.Gateway.GitHubStore.connected?(login) do
+      for {pid, _} <- entries, do: send(pid, {:activity_update, login, payload})
+      Taggle.Gateway.Metrics.inc(:fanout_dispatched_total, length(entries))
+    else
+      _ ->
+        Taggle.Gateway.Metrics.inc(:fanout_skipped_total)
     end
 
     {:noreply, state}
@@ -31,7 +38,9 @@ defmodule Taggle.Gateway.GitHubFanout do
 
   def handle_info({:redix_pubsub, _pid, _ref, type, _}, state)
       when type in [:psubscribed, :disconnected] do
-    if type == :disconnected, do: Logger.warning("redis pubsub disconnected, redix will reconnect")
+    if type == :disconnected,
+      do: Logger.warning("redis pubsub disconnected, redix will reconnect")
+
     {:noreply, state}
   end
 
