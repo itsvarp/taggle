@@ -29,6 +29,8 @@ pub struct GitHub {
     repo_pushed_at: Mutex<HashMap<String, String>>,
     inst_pushed_at: Mutex<HashMap<String, String>>,
     last_search_at: Mutex<HashMap<String, Instant>>,
+    last_public_api_at: Mutex<HashMap<String, Instant>>,
+    web_repo_updated_at: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +72,8 @@ impl GitHub {
             repo_pushed_at: Mutex::new(HashMap::new()),
             inst_pushed_at: Mutex::new(HashMap::new()),
             last_search_at: Mutex::new(HashMap::new()),
+            last_public_api_at: Mutex::new(HashMap::new()),
+            web_repo_updated_at: Mutex::new(HashMap::new()),
         })
     }
 
@@ -189,6 +193,40 @@ impl GitHub {
         }
 
         Ok(Some(resp.json().await?))
+    }
+
+    async fn get_text(&self, url: &str, use_etag: bool) -> Result<Option<String>> {
+        let mut req = self.http.get(url);
+        if use_etag {
+            if let Some(etag) = self.etags.lock().unwrap().get(url).cloned() {
+                req = req.header("If-None-Match", etag);
+            }
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("github web request failed: {}", err.without_url()))?;
+        let status = resp.status();
+
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!("github web GET {url} failed: {status}");
+        }
+
+        if use_etag
+            && let Some(etag) = resp.headers().get("etag").and_then(|v| v.to_str().ok())
+        {
+            let mut map = self.etags.lock().unwrap();
+            if map.len() >= 2000 {
+                map.clear();
+            }
+            map.insert(url.to_owned(), etag.to_owned());
+        }
+
+        Ok(Some(resp.text().await?))
     }
 
     async fn graphql(&self, installation: i64, query: &str, variables: Value) -> Result<Value> {
@@ -315,10 +353,88 @@ impl GitHub {
         Ok(acts)
     }
 
+    /// Fetches public commits via github.com repositories tab + commits.atom (no REST API quota).
+    pub async fn backfill_user_web(&self, login: &str, use_etag: bool) -> Result<Vec<Act>> {
+        if !crate::store::valid_github_login(login) {
+            bail!("invalid GitHub login");
+        }
+
+        let repos_page_url = format!("https://github.com/{login}?tab=repositories");
+        let Some(html) = self.get_text(&repos_page_url, use_etag).await? else {
+            return Ok(vec![]);
+        };
+
+        let candidates: Vec<(String, String)> = parse_repo_updates(&html, login)
+            .into_iter()
+            .filter(|(full, updated_at)| {
+                if !use_etag || updated_at.is_empty() {
+                    return true;
+                }
+                self.web_repo_updated_at
+                    .lock()
+                    .unwrap()
+                    .get(full)
+                    .map(String::as_str)
+                    != Some(updated_at.as_str())
+            })
+            .take(5)
+            .collect();
+
+        let mut fetches = stream::iter(candidates.into_iter().map(|(full, updated_at)| async move {
+            let atom_url = format!("https://github.com/{full}/commits.atom");
+            let res = self.get_text(&atom_url, use_etag).await;
+            (full, updated_at, res)
+        }))
+        .buffer_unordered(4);
+
+        let mut acts = Vec::new();
+        let mut seen_keys = HashSet::new();
+
+        while let Some((full, updated_at, res)) = fetches.next().await {
+            match res {
+                Ok(Some(xml)) => {
+                    if !updated_at.is_empty() {
+                        let mut map = self.web_repo_updated_at.lock().unwrap();
+                        if map.len() >= 2000 {
+                            map.clear();
+                        }
+                        map.insert(full.clone(), updated_at);
+                    }
+                    for act in parse_commits_atom(&full, &xml) {
+                        if seen_keys.insert(act.key.clone()) {
+                            acts.push(act);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if !updated_at.is_empty() {
+                        self.web_repo_updated_at.lock().unwrap().insert(full, updated_at);
+                    }
+                }
+                Err(err) => tracing::debug!(error = %err, repo = %full, "atom commits fetch skipped"),
+            }
+        }
+
+        Ok(acts)
+    }
+
     /// Fetches public commits, pull requests and issues for a monitored user without webhooks.
     pub async fn backfill_user_public(&self, login: &str, oauth_token: Option<&str>, use_etag: bool) -> Result<Vec<Act>> {
         if !crate::store::valid_github_login(login) {
             bail!("invalid GitHub login");
+        }
+        if oauth_token.is_none() && use_etag {
+            let now = Instant::now();
+            let mut map = self.last_public_api_at.lock().unwrap();
+            if let Some(prev) = map.get(login)
+                && now.duration_since(*prev) < Duration::from_secs(120)
+            {
+                return Ok(vec![]);
+            }
+            if map.len() >= 1000 {
+                map.clear();
+            }
+            map.insert(login.to_owned(), now);
         }
         let mut acts = Vec::new();
         let mut seen_keys: HashSet<String> = HashSet::new();
@@ -874,6 +990,123 @@ fn parse_ts(raw: Option<&str>) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
+fn extract_tag<'a>(src: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let start = src.find(&open)?;
+    let after_open = &src[start + open.len()..];
+    let gt = after_open.find('>')?;
+    let inner_start = &after_open[gt + 1..];
+    let close = format!("</{tag}>");
+    let end = inner_start.find(&close)?;
+    Some(&inner_start[..end])
+}
+
+fn unescape_xml(raw: &str) -> String {
+    raw.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+pub fn parse_repo_updates(html: &str, login: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let marker = "itemprop=\"name codeRepository\"";
+    let mut rest = html;
+
+    while let Some(idx) = rest.find(marker) {
+        let prefix = &rest[..idx];
+        let after = &rest[idx + marker.len()..];
+
+        let href_slug = prefix
+            .rfind("<a ")
+            .and_then(|a_idx| prefix[a_idx..].split("href=\"/").nth(1))
+            .and_then(|s| s.split('"').next())
+            .filter(|slug| {
+                valid_repo_slug(slug)
+                    && slug
+                        .split_once('/')
+                        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(login))
+            });
+
+        let updated_at = after
+            .find("<relative-time")
+            .and_then(|rt_idx| after[rt_idx..].split("datetime=\"").nth(1))
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("");
+
+        if let Some(slug) = href_slug {
+            out.push((slug.to_owned(), updated_at.to_owned()));
+            if out.len() >= 6 {
+                break;
+            }
+        }
+
+        rest = after;
+    }
+
+    out
+}
+
+pub fn parse_commits_atom(full: &str, xml: &str) -> Vec<Act> {
+    let head = xml.split("<entry>").next().unwrap_or(xml);
+    let branch = head
+        .split(&format!("/{full}/commits/"))
+        .nth(1)
+        .and_then(|s| s.split(['<', '"', '\'']).next())
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+
+    let mut acts = Vec::new();
+    for entry in xml.split("<entry>").skip(1).take(5) {
+        let sha_full = entry
+            .split(&format!("/{full}/commit/"))
+            .nth(1)
+            .and_then(|s| s.split(['"', '\'', '<', '?', '#']).next())
+            .or_else(|| {
+                extract_tag(entry, "id")
+                    .and_then(|id| id.rsplit('/').next())
+                    .map(str::trim)
+            })
+            .unwrap_or("");
+
+        if sha_full.is_empty() || !sha_full.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        let short = &sha_full[..sha_full.len().min(7)];
+        let msg = extract_tag(entry, "title")
+            .map(|t| unescape_xml(t.trim()))
+            .and_then(|t| t.lines().next().map(|l| l.trim().to_owned()));
+        let at = parse_ts(extract_tag(entry, "updated").map(str::trim));
+        let author = extract_tag(entry, "author")
+            .and_then(|a| extract_tag(a, "name"))
+            .map(str::trim)
+            .filter(|a| !a.is_empty() && !a.contains(' '));
+        let url = format!("https://github.com/{full}/commit/{sha_full}");
+
+        acts.push(Act {
+            kind: "commit",
+            key: format!("{full}@{sha_full}"),
+            defaults: Value::Null,
+            base: json!({
+                "sha": short,
+                "message": msg,
+                "repo": full,
+                "branch": branch,
+                "private": false,
+                "author": author.map(person),
+                "url": url,
+                "timestamp": at,
+            }),
+            at,
+        });
+    }
+
+    acts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,5 +1168,40 @@ mod tests {
         assert!(!valid_repo_slug("octocat/../secret"));
         assert!(!valid_repo_slug("octocat/a/b"));
         assert!(!valid_repo_slug("octocat/"));
+    }
+
+    #[test]
+    fn parses_repo_updates_and_commits_atom() {
+        let html = r#"
+          <a href="/itsvarp/taggle" itemprop="name codeRepository" >
+          Updated <relative-time datetime="2026-11-12T19:18:50Z" class="no-wrap">Nov 12</relative-time>
+          <a href="/other/ignore" itemprop="name codeRepository" >
+          Updated <relative-time datetime="2026-11-12T19:00:00Z"></relative-time>
+        "#;
+        assert_eq!(
+            parse_repo_updates(html, "itsvarp"),
+            vec![("itsvarp/taggle".to_owned(), "2026-11-12T19:18:50Z".to_owned())]
+        );
+
+        let atom = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>tag:github.com,2008:/itsvarp/taggle/commits/main</id>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/2caeecc5d7ccbdf5820479954c0bb4beb4ec64bc</id>
+    <link type="text/html" rel="alternate" href="https://github.com/itsvarp/taggle/commit/2caeecc5d7ccbdf5820479954c0bb4beb4ec64bc"/>
+    <title>
+        perf(ingest): poll &amp; isolate
+    </title>
+    <updated>2026-11-12T19:18:48Z</updated>
+    <author><name>itsvarp</name></author>
+  </entry>
+</feed>"#;
+        let acts = parse_commits_atom("itsvarp/taggle", atom);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].key, "itsvarp/taggle@2caeecc5d7ccbdf5820479954c0bb4beb4ec64bc");
+        assert_eq!(acts[0].base["sha"], "2caeecc");
+        assert_eq!(acts[0].base["message"], "perf(ingest): poll & isolate");
+        assert_eq!(acts[0].base["branch"], "main");
+        assert_eq!(acts[0].base["author"]["username"], "itsvarp");
     }
 }

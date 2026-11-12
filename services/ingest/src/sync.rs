@@ -93,27 +93,36 @@ pub async fn sync_all(app: &App) -> Result<()> {
 
     let mut fetches = stream::iter(connected.into_iter().map(|login| async move {
         let use_etag = app.store.has_activities(&login).await.unwrap_or(false);
-        let res = github.backfill_user_public(&login, None, use_etag).await;
-        (login, res)
+        let (web_res, api_res) = tokio::join!(
+            github.backfill_user_web(&login, use_etag),
+            github.backfill_user_public(&login, None, use_etag),
+        );
+        (login, web_res, api_res)
     }))
     .buffer_unordered(4);
 
-    while let Some((login, res)) = fetches.next().await {
-        match res {
-            Ok(acts) if !acts.is_empty() => {
-                for act in acts {
-                    if let Err(err) = app
-                        .store
-                        .upsert_activity(&login, act.kind, &act.key, &act.defaults, &act.base, act.at)
-                        .await
-                    {
-                        tracing::warn!(error = %err, key = %act.key, "upsert public activity failed");
+    while let Some((login, web_res, api_res)) = fetches.next().await {
+        let mut updated = false;
+        for (source, res) in [("web", web_res), ("public", api_res)] {
+            match res {
+                Ok(acts) if !acts.is_empty() => {
+                    for act in acts {
+                        if let Err(err) = app
+                            .store
+                            .upsert_activity(&login, act.kind, &act.key, &act.defaults, &act.base, act.at)
+                            .await
+                        {
+                            tracing::warn!(error = %err, key = %act.key, source, "upsert public activity failed");
+                        }
                     }
+                    updated = true;
                 }
-                dirty.insert(login);
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, %login, source, "public sync failed"),
             }
-            Ok(_) => {}
-            Err(err) => tracing::warn!(error = %err, %login, "public sync failed"),
+        }
+        if updated {
+            dirty.insert(login);
         }
     }
 
