@@ -1,0 +1,104 @@
+name: taggle
+
+# Full Taggle stack in Docker. Ports are bound to 127.0.0.1 and offset (5433/6380)
+# so host services never collide. Start via `make up` (injects secrets from Infisical
+# without writing them to disk).
+#
+# GitHub and Discord are independently optional. Leave GITHUB_* empty for a
+# Discord-only deployment, or DISCORD_* empty for a GitHub-only deployment.
+# Both empty still serves /health.
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: taggle
+      POSTGRES_PASSWORD: taggle
+      POSTGRES_DB: taggle
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - taggle_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taggle"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ingest:
+    build:
+      context: .
+      dockerfile: services/ingest/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4001:4001"
+    environment:
+      INGEST_PORT: "4001"
+      DATABASE_URL: postgres://taggle:taggle@postgres:5432/taggle
+      REDIS_URL: redis://redis:6379
+      # GitHub App (optional)
+      GITHUB_APP_ID:
+      GITHUB_WEBHOOK_SECRET:
+      GITHUB_APP_PRIVATE_KEY:
+      # Discord bot (optional). Enable PRESENCE + SERVER MEMBERS intents in the
+      # Discord developer portal. DISCORD_GUILD_IDS limits monitoring to specific
+      # servers (comma-separated); empty means every guild the bot is in.
+      DISCORD_BOT_TOKEN:
+      DISCORD_GUILD_IDS:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  gateway:
+    build:
+      context: services/gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      PORT: "4000"
+      BASE_URL: ${BASE_URL:-http://localhost:4000}
+      INGEST_URL: http://ingest:4001
+      DATABASE_URL: postgres://taggle:taggle@postgres:5432/taggle
+      REDIS_URL: redis://redis:6379
+      # GitHub OAuth (optional)
+      GITHUB_APP_CLIENT_ID:
+      GITHUB_APP_CLIENT_SECRET:
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
+      # Discord OAuth (optional; only needed for Discord KV API keys)
+      DISCORD_CLIENT_ID:
+      DISCORD_CLIENT_SECRET:
+      DISCORD_INVITE_URL: ${DISCORD_INVITE_URL:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  taggle_pg:

@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+*.pem
+.infisical.json
+.infisical.yaml
+infra/
+docs/
+**/target/
+**/_build/
+**/deps/
+node_modules/

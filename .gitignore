@@ -1,0 +1,13 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+.infisical.json
+.infisical.yaml
+
+# build
+target/
+_build/
+deps/
+node_modules/

@@ -1,4 +1,6 @@
-# 🏷️ Taggle
+# Taggle
+
+Inspired by the [Lanyard](https://github.com/Phineas/lanyard) project.
 
 **Your Discord presence and GitHub activity, in one small API.**
 
