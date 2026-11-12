@@ -10,8 +10,8 @@ pub fn spawn_background(app: Arc<App>) {
     let secs: u64 = std::env::var("SYNC_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .map(|s: u64| s.max(30))
-        .unwrap_or(180);
+        .map(|s: u64| s.max(5))
+        .unwrap_or(15);
 
     tokio::spawn(async move {
         if let Err(err) = sync_all(&app).await {

@@ -24,7 +24,11 @@ pub struct GitHub {
     key: EncodingKey,
     tokens: Mutex<HashMap<i64, (String, Instant)>>,
     etags: Mutex<HashMap<String, String>>,
-    unauth_reset_at: Mutex<Option<Instant>>,
+    unauth_core_reset_at: Mutex<Option<Instant>>,
+    unauth_search_reset_at: Mutex<Option<Instant>>,
+    repo_pushed_at: Mutex<HashMap<String, String>>,
+    inst_pushed_at: Mutex<HashMap<String, String>>,
+    last_search_at: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Serialize)]
@@ -61,7 +65,11 @@ impl GitHub {
             key: EncodingKey::from_rsa_pem(pem.as_bytes()).context("invalid GITHUB_APP_PRIVATE_KEY")?,
             tokens: Mutex::new(HashMap::new()),
             etags: Mutex::new(HashMap::new()),
-            unauth_reset_at: Mutex::new(None),
+            unauth_core_reset_at: Mutex::new(None),
+            unauth_search_reset_at: Mutex::new(None),
+            repo_pushed_at: Mutex::new(HashMap::new()),
+            inst_pushed_at: Mutex::new(HashMap::new()),
+            last_search_at: Mutex::new(HashMap::new()),
         })
     }
 
@@ -98,8 +106,14 @@ impl GitHub {
     }
 
     async fn get_json(&self, url: &str, bearer: Option<&str>, use_etag: bool) -> Result<Option<Value>> {
+        let is_search = url.contains("/search/");
         if bearer.is_none() {
-            if let Some(until) = *self.unauth_reset_at.lock().unwrap() {
+            let cooldown = if is_search {
+                &self.unauth_search_reset_at
+            } else {
+                &self.unauth_core_reset_at
+            };
+            if let Some(until) = *cooldown.lock().unwrap() {
                 if Instant::now() < until {
                     bail!("github public rate limit cooling down");
                 }
@@ -149,7 +163,12 @@ impl GitHub {
                         Some(reset.saturating_sub(now).clamp(30, 900))
                     })
                     .unwrap_or(120);
-                *self.unauth_reset_at.lock().unwrap() = Some(Instant::now() + Duration::from_secs(wait_secs));
+                let target = if is_search {
+                    &self.unauth_search_reset_at
+                } else {
+                    &self.unauth_core_reset_at
+                };
+                *target.lock().unwrap() = Some(Instant::now() + Duration::from_secs(wait_secs));
             }
             bail!("github GET {url} failed: {status}");
         }
@@ -271,9 +290,25 @@ impl GitHub {
             if !valid_repo_slug(full) {
                 continue;
             }
+            let pushed_at = r.get("pushed_at").and_then(Value::as_str).unwrap_or("");
+            let cache_key = format!("{installation}:{full}");
+            if !pushed_at.is_empty()
+                && self.inst_pushed_at.lock().unwrap().get(&cache_key).map(String::as_str) == Some(pushed_at)
+            {
+                continue;
+            }
             let Some((owner, name)) = full.split_once('/') else { continue };
             match self.backfill_repo(installation, owner, name).await {
-                Ok(mut repo_acts) => acts.append(&mut repo_acts),
+                Ok(mut repo_acts) => {
+                    if !pushed_at.is_empty() {
+                        let mut map = self.inst_pushed_at.lock().unwrap();
+                        if map.len() >= 1000 {
+                            map.clear();
+                        }
+                        map.insert(cache_key, pushed_at.to_owned());
+                    }
+                    acts.append(&mut repo_acts);
+                }
                 Err(err) => tracing::warn!(error = %err, repo = full, "repo backfill failed"),
             }
         }
@@ -296,7 +331,24 @@ impl GitHub {
         );
 
         let any_new_activity = matches!(repos_res, Ok(Some(_))) || matches!(events_res, Ok(Some(_)));
-        let (search1_res, search2_res) = if !use_etag || oauth_token.is_some() || any_new_activity {
+        let search_due = if !use_etag || oauth_token.is_some() {
+            true
+        } else if any_new_activity {
+            let now = Instant::now();
+            let last = self.last_search_at.lock().unwrap().get(login).copied();
+            last.is_none_or(|prev| now.duration_since(prev) >= Duration::from_secs(180))
+        } else {
+            false
+        };
+
+        let (search1_res, search2_res) = if search_due {
+            if oauth_token.is_none() {
+                let mut map = self.last_search_at.lock().unwrap();
+                if map.len() >= 1000 {
+                    map.clear();
+                }
+                map.insert(login.to_owned(), Instant::now());
+            }
             let search_involves = format!("{API}/search/issues?q=involves:{login}+is:public&sort=updated&order=desc&per_page=10");
             let search_user = format!("{API}/search/issues?q=user:{login}+is:public&sort=updated&order=desc&per_page=10");
             tokio::join!(
@@ -310,7 +362,7 @@ impl GitHub {
         // 1. Recent commits from the user's most recently pushed public repos.
         match repos_res {
             Ok(Some(repos_val)) => {
-                let public_repos: Vec<(String, String)> = repos_val
+                let public_repos: Vec<(String, String, String)> = repos_val
                     .as_array()
                     .into_iter()
                     .flatten()
@@ -325,21 +377,39 @@ impl GitHub {
                             .and_then(Value::as_str)
                             .unwrap_or("main")
                             .to_owned();
-                        Some((full, branch))
+                        let pushed_at = r
+                            .get("pushed_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        if use_etag
+                            && !pushed_at.is_empty()
+                            && self.repo_pushed_at.lock().unwrap().get(&full).map(String::as_str) == Some(pushed_at.as_str())
+                        {
+                            return None;
+                        }
+                        Some((full, branch, pushed_at))
                     })
                     .take(5)
                     .collect();
 
-                let mut commit_fetches = stream::iter(public_repos.into_iter().map(|(full, branch)| async move {
+                let mut commit_fetches = stream::iter(public_repos.into_iter().map(|(full, branch, pushed_at)| async move {
                     let commits_url = format!("{API}/repos/{full}/commits?per_page=5");
                     let res = self.get_json(&commits_url, oauth_token, use_etag).await;
-                    (full, branch, res)
+                    (full, branch, pushed_at, res)
                 }))
                 .buffer_unordered(4);
 
-                while let Some((full, branch, res)) = commit_fetches.next().await {
+                while let Some((full, branch, pushed_at, res)) = commit_fetches.next().await {
                     match res {
                         Ok(Some(commits_val)) => {
+                            if !pushed_at.is_empty() {
+                                let mut map = self.repo_pushed_at.lock().unwrap();
+                                if map.len() >= 2000 {
+                                    map.clear();
+                                }
+                                map.insert(full.clone(), pushed_at);
+                            }
                             for c in commits_val.as_array().into_iter().flatten() {
                                 if let Some(act) = rest_commit_to_act(&full, Some(&branch), c)
                                     && seen_keys.insert(act.key.clone())
@@ -348,7 +418,11 @@ impl GitHub {
                                 }
                             }
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            if !pushed_at.is_empty() {
+                                self.repo_pushed_at.lock().unwrap().insert(full, pushed_at);
+                            }
+                        }
                         Err(err) => tracing::debug!(error = %err, repo = %full, "public commits fetch skipped"),
                     }
                 }
